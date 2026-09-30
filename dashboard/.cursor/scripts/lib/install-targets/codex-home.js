@@ -1,0 +1,200 @@
+const os = require('node:os');
+const path = require('node:path');
+
+const {
+  createInstallTargetAdapter,
+  createRemappedOperation,
+  isForeignPlatformPath,
+  planFlatSkillOperation,
+  resolveModulesPlan,
+} = require('./helpers');
+const {
+  GATEGUARD_HOOK_MODULE_ID,
+  GATEGUARD_HOOK_SCRIPT_SOURCE_RELATIVE_PATH,
+  CRUSHER_HOOK_MODULE_ID,
+  CRUSHER_HOOK_SCRIPT_SOURCE_RELATIVE_PATH,
+  BASH_GUARDIAN_HOOK_MODULE_ID,
+  BASH_GUARDIAN_HOOK_SCRIPT_SOURCE_RELATIVE_PATH,
+  HOOK_OPERATION_KIND,
+  PRE_TOOL_USE_EVENT,
+  createGateGuardScriptCopyOperations,
+  createCrusherScriptCopyOperations,
+  createBashGuardianScriptCopyOperations,
+  createMeshNoticeScriptCopyOperations,
+  createMeshNoticeHookMergeOperationForDestination,
+  resolveMeshNoticeHookScriptDestination,
+} = require('../claude-settings-hooks');
+
+// Codex CLI's skills root (~/.agents, this adapter's own resolveRoot()) and
+// its runtime config root (~/.codex, where hooks.json/config.toml live) are
+// two different directories - confirmed against scripts/codex/*.sh and
+// codex-hooks.test.js, which both key hook/config installation off
+// CODEX_HOME (default ~/.codex), independent of AGENTS_HOME (default
+// ~/.agents). A PreToolUse hook registered under ~/.agents would never be
+// discovered by Codex CLI, so the gate has to be wired into ~/.codex/hooks.json
+// directly. Docs: https://developers.openai.com/codex/hooks (redirects to
+// https://learn.chatgpt.com/docs/hooks) documents ~/.codex/hooks.json as a
+// discovery location and the exact same
+// {hooks: {PreToolUse: [{matcher, hooks: [{type, command}]}]}} JSON schema,
+// including hookSpecificOutput.permissionDecision:"deny" for blocking, that
+// gateguard-fact-force.js's CLI entrypoint already emits for Claude Code.
+//
+// Deliberately does NOT read process.env.CODEX_HOME here (unlike the
+// standalone scripts/sync-egc-to-codex.sh flow): every other adapter in this
+// registry derives its root purely from `input.homeDir`, and honoring an
+// ambient env var would make this adapter's output depend on the caller's
+// shell environment instead of its explicit input, which breaks test
+// hermeticity and risks writing to a real ~/.codex during a hermetic test run.
+function resolveCodexHome(input) {
+  return path.join(input.homeDir || os.homedir(), '.codex');
+}
+
+function buildCodexPreToolUseMergeOperation(codexHome, moduleId, sourceRelativePath, hookScriptPath, matcher) {
+  return {
+    kind: HOOK_OPERATION_KIND,
+    moduleId,
+    sourceRelativePath,
+    destinationPath: path.join(codexHome, 'hooks.json'),
+    strategy: HOOK_OPERATION_KIND,
+    ownership: 'managed',
+    scaffoldOnly: false,
+    hookEvent: PRE_TOOL_USE_EVENT,
+    hookMatcher: matcher,
+    hookScriptPath,
+  };
+}
+
+function createCodexGateGuardOperations(adapter, codexHome) {
+  const hookScriptPath = path.join(codexHome, 'scripts', 'hooks', 'gateguard-fact-force.js');
+  const copyOperations = createGateGuardScriptCopyOperations(
+    (moduleId, sourceRelativePath, destinationPath, options) => (
+      createRemappedOperation(adapter, moduleId, sourceRelativePath, destinationPath, options)
+    ),
+    codexHome
+  );
+
+  // "apply_patch" is Codex's canonical tool_name for file edits (Edit/Write
+  // are matcher aliases only, per codex-rs/core/src/tools/hook_names.rs);
+  // "Bash" is used verbatim for both the legacy shell tool and unified_exec.
+  const mergeOperations = ['apply_patch', 'Bash'].map(matcher => (
+    buildCodexPreToolUseMergeOperation(
+      codexHome,
+      GATEGUARD_HOOK_MODULE_ID,
+      GATEGUARD_HOOK_SCRIPT_SOURCE_RELATIVE_PATH,
+      hookScriptPath,
+      matcher
+    )
+  ));
+
+  return [...copyOperations, ...mergeOperations];
+}
+
+// Token Crusher for Codex: Codex reads the same hooks.json schema as Claude
+// Code, so a crusher-hook.js rewrite returned as
+// hookSpecificOutput.updatedInput.command is applied before the command runs.
+// Only the Bash matcher: the crusher compresses shell output, and apply_patch
+// is a file edit with nothing to crush.
+function createCodexCrusherOperations(adapter, codexHome) {
+  const hookScriptPath = path.join(codexHome, 'scripts', 'hooks', 'crusher-hook.js');
+  const copyOperations = createCrusherScriptCopyOperations(
+    (moduleId, sourceRelativePath, destinationPath, options) => (
+      createRemappedOperation(adapter, moduleId, sourceRelativePath, destinationPath, options)
+    ),
+    codexHome
+  );
+
+  const mergeOperation = buildCodexPreToolUseMergeOperation(
+    codexHome,
+    CRUSHER_HOOK_MODULE_ID,
+    CRUSHER_HOOK_SCRIPT_SOURCE_RELATIVE_PATH,
+    hookScriptPath,
+    'Bash'
+  );
+
+  return [...copyOperations, mergeOperation];
+}
+
+// EGC Guardian for Codex: the GateGuard hook above only forces investigation
+// before a risky action, it never checks a Bash command against the
+// Guardian's actual allowlist/denylist. 2026-07-27 audit (EGC-460/462, cross-
+// referenced against the 2026-07-27 Guardian-perfection mandate) found Codex
+// wired only GateGuard + Token Crusher into hooks.json, never
+// pre-bash-guardian-validate.js. Wired on the 'Bash' matcher only, the same
+// scope every other install target uses (the Guardian validates shell
+// commands, not file edits; no install target wires a write-validator hook).
+//
+// pre-bash-guardian-validate.js is registered directly, with no translation
+// adapter (unlike Windsurf's windsurf-guardian-adapter.js): Codex's own docs
+// (https://developers.openai.com/codex/hooks, redirects to
+// https://learn.chatgpt.com/docs/hooks) confirm the exit-code-2-plus-stderr
+// contract this hook already uses for Claude Code is explicitly supported as
+// an alternative to the JSON hookSpecificOutput.permissionDecision form -
+// verified against the docs before wiring, not assumed.
+function createCodexGuardianOperations(adapter, codexHome) {
+  const hookScriptPath = path.join(codexHome, 'scripts', 'hooks', 'pre-bash-guardian-validate.js');
+  const copyOperations = createBashGuardianScriptCopyOperations(
+    (moduleId, sourceRelativePath, destinationPath, options) => (
+      createRemappedOperation(adapter, moduleId, sourceRelativePath, destinationPath, options)
+    ),
+    codexHome
+  );
+
+  const mergeOperation = buildCodexPreToolUseMergeOperation(
+    codexHome,
+    BASH_GUARDIAN_HOOK_MODULE_ID,
+    BASH_GUARDIAN_HOOK_SCRIPT_SOURCE_RELATIVE_PATH,
+    hookScriptPath,
+    'Bash'
+  );
+
+  return [...copyOperations, mergeOperation];
+}
+
+// Session-mesh wake-signal notice for Codex: the official hooks docs
+// (https://developers.openai.com/codex/hooks) document UserPromptSubmit with
+// hookSpecificOutput.additionalContext "added as extra developer context",
+// which is exactly the dual-field JSON mesh-events-inject.js already emits,
+// so the standalone script is copied under CODEX_HOME and registered with no
+// translation, same copy-plus-merge discipline as the three wirings above.
+function createCodexMeshNoticeOperations(adapter, codexHome) {
+  const copyOperations = createMeshNoticeScriptCopyOperations(
+    (moduleId, sourceRelativePath, destinationPath, options) => (
+      createRemappedOperation(adapter, moduleId, sourceRelativePath, destinationPath, options)
+    ),
+    codexHome
+  );
+
+  const mergeOperation = createMeshNoticeHookMergeOperationForDestination(
+    path.join(codexHome, 'hooks.json'),
+    resolveMeshNoticeHookScriptDestination(codexHome)
+  );
+
+  return [...copyOperations, mergeOperation];
+}
+
+module.exports = createInstallTargetAdapter({
+  id: 'codex-home',
+  target: 'codex',
+  kind: 'home',
+  rootSegments: ['.agents'],
+  installStatePathSegments: ['egc', 'codex-install-state.json'],
+  nativeRootRelativePath: '.agents',
+  planOperations(input, adapter) {
+    const { modules, planningInput, targetRoot } = resolveModulesPlan(input, adapter);
+
+    const moduleOperations = modules.flatMap(module => {
+      const paths = (Array.isArray(module.paths) ? module.paths : [])
+        .filter(p => !isForeignPlatformPath(p, adapter.target));
+      return paths.map(sourceRelativePath => planFlatSkillOperation(adapter, module.id, sourceRelativePath, planningInput, targetRoot));
+    });
+
+    const codexHome = resolveCodexHome(planningInput);
+    return [
+      ...moduleOperations,
+      ...createCodexGateGuardOperations(adapter, codexHome),
+      ...createCodexCrusherOperations(adapter, codexHome),
+      ...createCodexGuardianOperations(adapter, codexHome),
+      ...createCodexMeshNoticeOperations(adapter, codexHome),
+    ];
+  },
+});

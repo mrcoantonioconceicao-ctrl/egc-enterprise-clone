@@ -1,0 +1,350 @@
+const fs = require('node:fs');
+const path = require('node:path');
+const { hasParentSegment, isAnchoredPath } = require('./path-safety');
+const { replaceFileWith } = require('./install/preserving-write');
+
+
+let Ajv = null;
+try {
+  // Prefer schema-backed validation when dependencies are installed.
+  // The fallback validator below keeps source checkouts usable in bare environments.
+  const ajvModule = require('ajv');
+  Ajv = ajvModule.default || ajvModule;
+} catch (_error) { // NOSONAR: optional ajv dependency; fallback validator is used when absent
+  Ajv = null;
+}
+
+const SCHEMA_PATH = path.join(__dirname, '..', '..', 'schemas', 'install-state.schema.json');
+
+let cachedValidator = null;
+
+function cloneJsonValue(value) {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  return structuredClone(value);
+}
+
+function readJson(filePath, label) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (error) {
+    throw new Error(`Failed to read ${label}: ${error.message}`, { cause: error });
+  }
+}
+
+function isNonEmptyString(value) {
+  return typeof value === 'string' && value.length > 0;
+}
+
+function validateNoAdditionalProperties(value, instancePath, allowedKeys, pushError) {
+  for (const key of Object.keys(value)) {
+    if (!allowedKeys.includes(key)) {
+      pushError(`${instancePath}/${key}`, 'must NOT have additional properties');
+    }
+  }
+}
+
+function validateStringArray(value, instancePath, pushError) {
+  if (!Array.isArray(value)) {
+    pushError(instancePath, 'must be array');
+    return;
+  }
+
+  for (let index = 0; index < value.length; index += 1) {
+    if (!isNonEmptyString(value[index])) {
+      pushError(`${instancePath}/${index}`, 'must be non-empty string');
+    }
+  }
+}
+
+function validateOptionalString(value, instancePath, pushError) {
+  if (value !== undefined && value !== null && !isNonEmptyString(value)) {
+    pushError(instancePath, 'must be string or null');
+  }
+}
+
+function validateStateTarget(target, pushError) {
+  if (!target || typeof target !== 'object' || Array.isArray(target)) {
+    pushError('/target', 'must be object');
+    return;
+  }
+
+  validateNoAdditionalProperties(target, '/target', ['id', 'target', 'kind', 'root', 'installStatePath'], pushError);
+  if (!isNonEmptyString(target.id)) {
+    pushError('/target/id', 'must be non-empty string');
+  }
+  validateOptionalString(target.target, '/target/target', pushError);
+  if (target.kind !== undefined && !['home', 'project'].includes(target.kind)) {
+    pushError('/target/kind', 'must be equal to one of the allowed values');
+  }
+  if (!isNonEmptyString(target.root)) {
+    pushError('/target/root', 'must be non-empty string');
+  }
+  if (!isNonEmptyString(target.installStatePath)) {
+    pushError('/target/installStatePath', 'must be non-empty string');
+  }
+}
+
+function validateStateRequest(request, pushError) {
+  if (!request || typeof request !== 'object' || Array.isArray(request)) {
+    pushError('/request', 'must be object');
+    return;
+  }
+
+  validateNoAdditionalProperties(
+    request,
+    '/request',
+    ['profile', 'modules', 'includeComponents', 'excludeComponents', 'legacyLanguages', 'legacyMode'],
+    pushError
+  );
+  if (!(Object.hasOwn(request, 'profile') && (request.profile === null || typeof request.profile === 'string'))) {
+    pushError('/request/profile', 'must be string or null');
+  }
+  validateStringArray(request.modules, '/request/modules', pushError);
+  validateStringArray(request.includeComponents, '/request/includeComponents', pushError);
+  validateStringArray(request.excludeComponents, '/request/excludeComponents', pushError);
+  validateStringArray(request.legacyLanguages, '/request/legacyLanguages', pushError);
+  if (typeof request.legacyMode !== 'boolean') {
+    pushError('/request/legacyMode', 'must be boolean');
+  }
+}
+
+function validateStateResolution(resolution, pushError) {
+  if (!resolution || typeof resolution !== 'object' || Array.isArray(resolution)) {
+    pushError('/resolution', 'must be object');
+    return;
+  }
+
+  validateNoAdditionalProperties(resolution, '/resolution', ['selectedModules', 'skippedModules'], pushError);
+  validateStringArray(resolution.selectedModules, '/resolution/selectedModules', pushError);
+  validateStringArray(resolution.skippedModules, '/resolution/skippedModules', pushError);
+}
+
+function validateStateSource(source, pushError) {
+  if (!source || typeof source !== 'object' || Array.isArray(source)) {
+    pushError('/source', 'must be object');
+    return;
+  }
+
+  validateNoAdditionalProperties(source, '/source', ['repoVersion', 'repoCommit', 'manifestVersion'], pushError);
+  validateOptionalString(source.repoVersion, '/source/repoVersion', pushError);
+  validateOptionalString(source.repoCommit, '/source/repoCommit', pushError);
+  if (!Number.isInteger(source.manifestVersion) || source.manifestVersion < 1) {
+    pushError('/source/manifestVersion', 'must be integer >= 1');
+  }
+}
+
+const OPERATION_STRING_FIELDS = [
+  'kind',
+  'moduleId',
+  'sourceRelativePath',
+  'destinationPath',
+  'strategy',
+  'ownership',
+];
+
+// A recorded destination is replayed by repair and uninstall, and the source
+// is joined onto the reference repository: neither may climb. "Absolute"
+// means anchored on either platform family, the same rule the JSON schema
+// applies, so both validators agree whatever host wrote the file.
+function validateOperationPaths(operation, instancePath, pushError) {
+  const destination = operation.destinationPath;
+  if (isNonEmptyString(destination) && (!isAnchoredPath(destination) || hasParentSegment(destination))) {
+    pushError(`${instancePath}/destinationPath`, 'must be an absolute path without ".." segments');
+  }
+  const source = operation.sourceRelativePath;
+  if (isNonEmptyString(source) && (isAnchoredPath(source) || hasParentSegment(source))) {
+    pushError(`${instancePath}/sourceRelativePath`, 'must be a relative path without ".." segments');
+  }
+}
+
+function validateOperation(operation, instancePath, pushError) {
+  for (const field of OPERATION_STRING_FIELDS) {
+    if (!isNonEmptyString(operation[field])) {
+      pushError(`${instancePath}/${field}`, 'must be non-empty string');
+    }
+  }
+  validateOperationPaths(operation, instancePath, pushError);
+  if (typeof operation.scaffoldOnly !== 'boolean') {
+    pushError(`${instancePath}/scaffoldOnly`, 'must be boolean');
+  }
+}
+
+function validateStateOperations(operations, pushError) {
+  if (!Array.isArray(operations)) {
+    pushError('/operations', 'must be array');
+    return;
+  }
+
+  for (let index = 0; index < operations.length; index += 1) {
+    const operation = operations[index];
+    const instancePath = `/operations/${index}`;
+
+    if (!operation || typeof operation !== 'object' || Array.isArray(operation)) {
+      pushError(instancePath, 'must be object');
+      continue;
+    }
+
+    validateOperation(operation, instancePath, pushError);
+  }
+}
+
+function getValidator() {
+  if (cachedValidator) {
+    return cachedValidator;
+  }
+
+  if (Ajv) {
+    const schema = readJson(SCHEMA_PATH, 'install-state schema');
+    const ajv = new Ajv({ allErrors: true });
+    cachedValidator = ajv.compile(schema);
+    return cachedValidator;
+  }
+
+  cachedValidator = createFallbackValidator();
+  return cachedValidator;
+}
+
+function createFallbackValidator() {
+  const validate = state => {
+    const errors = [];
+    validate.errors = errors;
+
+    function pushError(instancePath, message) {
+      errors.push({ instancePath, message });
+    }
+
+    if (!state || typeof state !== 'object' || Array.isArray(state)) {
+      pushError('/', 'must be object');
+      return false;
+    }
+
+    validateNoAdditionalProperties(
+      state,
+      '',
+      ['schemaVersion', 'installedAt', 'lastValidatedAt', 'target', 'request', 'resolution', 'source', 'operations'],
+      pushError
+    );
+
+    if (state.schemaVersion !== 'egc.install.v1') {
+      pushError('/schemaVersion', 'must equal egc.install.v1');
+    }
+
+    if (!isNonEmptyString(state.installedAt)) {
+      pushError('/installedAt', 'must be non-empty string');
+    }
+
+    if (state.lastValidatedAt !== undefined && !isNonEmptyString(state.lastValidatedAt)) {
+      pushError('/lastValidatedAt', 'must be non-empty string');
+    }
+
+    validateStateTarget(state.target, pushError);
+    validateStateRequest(state.request, pushError);
+    validateStateResolution(state.resolution, pushError);
+    validateStateSource(state.source, pushError);
+    validateStateOperations(state.operations, pushError);
+
+    return errors.length === 0;
+  };
+
+  validate.errors = [];
+  return validate;
+}
+
+function formatValidationErrors(errors = []) {
+  return errors
+    .map(error => `${error.instancePath || '/'} ${error.message}`)
+    .join('; ');
+}
+
+function validateInstallState(state) {
+  const validator = getValidator();
+  const valid = validator(state);
+  return {
+    valid,
+    errors: validator.errors || [],
+  };
+}
+
+function assertValidInstallState(state, label) {
+  const result = validateInstallState(state);
+  if (!result.valid) {
+    throw new Error(`Invalid install-state${label ? ' (' + label + ')' : ''}: ${formatValidationErrors(result.errors)}`);
+  }
+}
+
+function createInstallState(options) {
+  const installedAt = options.installedAt || new Date().toISOString();
+  const state = {
+    schemaVersion: 'egc.install.v1',
+    installedAt,
+    target: {
+      id: options.adapter.id,
+      target: options.adapter.target || undefined,
+      kind: options.adapter.kind || undefined,
+      root: options.targetRoot,
+      installStatePath: options.installStatePath,
+    },
+    request: {
+      profile: options.request.profile || null,
+      modules: Array.isArray(options.request.modules) ? [...options.request.modules] : [],
+      includeComponents: Array.isArray(options.request.includeComponents)
+        ? [...options.request.includeComponents]
+        : [],
+      excludeComponents: Array.isArray(options.request.excludeComponents)
+        ? [...options.request.excludeComponents]
+        : [],
+      legacyLanguages: Array.isArray(options.request.legacyLanguages)
+        ? [...options.request.legacyLanguages]
+        : [],
+      legacyMode: Boolean(options.request.legacyMode),
+    },
+    resolution: {
+      selectedModules: Array.isArray(options.resolution.selectedModules)
+        ? [...options.resolution.selectedModules]
+        : [],
+      skippedModules: Array.isArray(options.resolution.skippedModules)
+        ? [...options.resolution.skippedModules]
+        : [],
+    },
+    source: {
+      repoVersion: options.source.repoVersion || null,
+      repoCommit: options.source.repoCommit || null,
+      manifestVersion: options.source.manifestVersion,
+    },
+    operations: Array.isArray(options.operations)
+      ? options.operations.map(operation => cloneJsonValue(operation))
+      : [],
+  };
+
+  if (options.lastValidatedAt) {
+    state.lastValidatedAt = options.lastValidatedAt;
+  }
+
+  assertValidInstallState(state, 'create');
+  return state;
+}
+
+function readInstallState(filePath) {
+  const state = readJson(filePath, 'install-state');
+  assertValidInstallState(state, filePath);
+  return state;
+}
+
+function writeInstallState(filePath, state) {
+  assertValidInstallState(state, filePath);
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  // The state file lands like every managed file: an exclusive temporary
+  // renamed over the destination, so a link there is replaced, not followed.
+  replaceFileWith(filePath, descriptor => fs.writeFileSync(descriptor, `${JSON.stringify(state, null, 2)}\n`));
+  return state;
+}
+
+module.exports = {
+  createInstallState,
+  readInstallState,
+  validateInstallState,
+  writeInstallState,
+};

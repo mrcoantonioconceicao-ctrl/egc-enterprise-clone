@@ -1,0 +1,84 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"/data/data/com.termux/files/usr/bin/node\" \"/data/data/com.termux/files/home/EGC/dashboard/.agents/scripts/hooks/gateguard-fact-force.js\""
+          }
+        ],
+        "matcher": "Edit"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"/data/data/com.termux/files/usr/bin/node\" \"/data/data/com.termux/files/home/EGC/dashboard/.agents/scripts/hooks/gateguard-fact-force.js\""
+          }
+        ],
+        "matcher": "Write"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"/data/data/com.termux/files/usr/bin/node\" \"/data/data/com.termux/files/home/EGC/dashboard/.agents/scripts/hooks/gateguard-fact-force.js\""
+          }
+        ],
+        "matcher": "MultiEdit"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"/data/data/com.termux/files/usr/bin/node\" \"/data/data/com.termux/files/home/EGC/dashboard/.agents/scripts/hooks/gateguard-fact-force.js\""
+          }
+        ],
+        "matcher": "Bash"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"/data/data/com.termux/files/usr/bin/node\" \"/data/data/com.termux/files/home/EGC/dashboard/.agents/scripts/hooks/crusher-hook.js\""
+          }
+        ],
+        "matcher": "Bash"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"/data/data/com.termux/files/usr/bin/node\" \"/data/data/com.termux/files/home/EGC/dashboard/.agents/scripts/hooks/pre-bash-guardian-validate.js\""
+          }
+        ],
+        "matcher": "Bash"
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"/data/data/com.termux/files/usr/bin/node\" \"/data/data/com.termux/files/home/EGC/dashboard/.agents/scripts/hooks/mesh-events-inject.js\""
+          }
+        ]
+      }
+    ]
+  },
+  "egc-guardian": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command|write_to_file|replace_file_content|multi_replace_file_content",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"/data/data/com.termux/files/usr/bin/node\" \"/data/data/com.termux/files/home/EGC/dashboard/.agents/scripts/hooks/antigravity-guardian-adapter.js\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

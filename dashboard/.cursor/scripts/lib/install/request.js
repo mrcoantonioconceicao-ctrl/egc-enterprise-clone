@@ -1,0 +1,164 @@
+'use strict';
+
+const { validateInstallModuleIds } = require('../install-manifests');
+
+const LEGACY_INSTALL_TARGETS = ['egc', 'cursor', 'antigravity'];
+
+function dedupeStrings(values) {
+  return [...new Set((Array.isArray(values) ? values : []).map(value => String(value).trim()).filter(Boolean))];
+}
+
+function applyNextArg(parsed, key, args, index) {
+  parsed[key] = args[index + 1] || null;
+  return 1;
+}
+
+function applyModules(parsed, args, index) {
+  const raw = args[index + 1] || '';
+  parsed.moduleIds = dedupeStrings(raw.split(','));
+  return 1;
+}
+
+function applyWithComponent(parsed, args, index) {
+  const componentId = args[index + 1] || '';
+  if (componentId.trim()) {
+    parsed.includeComponentIds.push(componentId.trim());
+  }
+  return 1;
+}
+
+function applyWithoutComponent(parsed, args, index) {
+  const componentId = args[index + 1] || '';
+  if (componentId.trim()) {
+    parsed.excludeComponentIds.push(componentId.trim());
+  }
+  return 1;
+}
+
+// The two bare-install flags contradict each other; argument order must not
+// decide silently, so the pair is refused at parse time.
+function applyPromptLibrary(parsed, value) {
+  if (parsed.promptLibrary !== null && parsed.promptLibrary !== value) {
+    throw new Error('--prompt-library and --no-prompt-library cannot be combined');
+  }
+  parsed.promptLibrary = value;
+  return 0;
+}
+
+const ARG_HANDLERS = {
+  '--target':   (parsed, args, i) => applyNextArg(parsed, 'target', args, i),
+  '--config':   (parsed, args, i) => applyNextArg(parsed, 'configPath', args, i),
+  '--profile':  (parsed, args, i) => applyNextArg(parsed, 'profileId', args, i),
+  '--modules':  (parsed, args, i) => applyModules(parsed, args, i),
+  '--with':     (parsed, args, i) => applyWithComponent(parsed, args, i),
+  '--without':  (parsed, args, i) => applyWithoutComponent(parsed, args, i),
+  '--dry-run':  (parsed) => { parsed.dryRun = true; return 0; },
+  '--json':     (parsed) => { parsed.json = true; return 0; },
+  '--require-detected': (parsed) => { parsed.requireDetected = true; return 0; },
+  '--allow-undetected': (parsed) => { parsed.allowUndetected = true; return 0; },
+  // Bare-install flags: the shell installers read them, the manifest path
+  // refuses them (a --target/--profile selection is already explicit).
+  '--prompt-library': (parsed) => applyPromptLibrary(parsed, true),
+  '--no-prompt-library': (parsed) => applyPromptLibrary(parsed, false),
+  '--help':     (parsed) => { parsed.help = true; return 0; },
+  '-h':         (parsed) => { parsed.help = true; return 0; },
+};
+
+function parseInstallArgs(argv) {
+  const args = argv.slice(2);
+  const parsed = {
+    target: null,
+    dryRun: false,
+    json: false,
+    help: false,
+    requireDetected: false,
+    allowUndetected: false,
+    promptLibrary: null,
+    configPath: null,
+    profileId: null,
+    moduleIds: [],
+    includeComponentIds: [],
+    excludeComponentIds: [],
+    languages: [],
+  };
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    const handler = ARG_HANDLERS[arg];
+
+    if (handler) {
+      index += handler(parsed, args, index);
+    } else if (arg.startsWith('--')) {
+      throw new Error(`Unknown argument: ${arg}`);
+    } else {
+      parsed.languages.push(arg);
+    }
+  }
+
+  if (parsed.requireDetected && parsed.allowUndetected) {
+    throw new Error('--require-detected and --allow-undetected are mutually exclusive');
+  }
+
+  return parsed;
+}
+
+const listOrEmpty = value => (Array.isArray(value) ? value : []);
+
+// A list the request carries in its config and in its options, in that
+// order, without repeats.
+function mergedList(config, options, key) {
+  return dedupeStrings([...(config?.[key] || []), ...(options[key] || [])]);
+}
+
+function requestedLanguages(options) {
+  return dedupeStrings(dedupeStrings([
+    ...listOrEmpty(options.legacyLanguages),
+    ...listOrEmpty(options.languages),
+  ]).map(language => language.toLowerCase()));
+}
+
+// A request selects either by manifest or by legacy language, never both,
+// and selects something unless it only asks for help.
+function checkSelection({ usingManifestMode, hasManifestBaseSelection, legacyLanguages, help }) {
+  if (usingManifestMode && legacyLanguages.length > 0) {
+    throw new Error(
+      'Legacy language arguments cannot be combined with --profile, --modules, --with, --without, or manifest config selections'
+    );
+  }
+
+  if (!help && !hasManifestBaseSelection && legacyLanguages.length === 0) {
+    throw new Error('No install profile, module IDs, included components, or legacy languages were provided');
+  }
+}
+
+function normalizeInstallRequest(options = {}) {
+  const config = options.config && typeof options.config === 'object'
+    ? options.config
+    : null;
+  const profileId = options.profileId || config?.profileId || null;
+  const moduleIds = validateInstallModuleIds(mergedList(config, options, 'moduleIds'));
+  const includeComponentIds = mergedList(config, options, 'includeComponentIds');
+  const excludeComponentIds = mergedList(config, options, 'excludeComponentIds');
+  const legacyLanguages = requestedLanguages(options);
+  const hasManifestBaseSelection = Boolean(profileId) || moduleIds.length > 0 || includeComponentIds.length > 0;
+  const usingManifestMode = hasManifestBaseSelection || excludeComponentIds.length > 0;
+
+  checkSelection({ usingManifestMode, hasManifestBaseSelection, legacyLanguages, help: options.help });
+
+  return {
+    mode: usingManifestMode ? 'manifest' : 'legacy-compat',
+    target: options.target || config?.target || 'egc',
+    profileId,
+    moduleIds,
+    includeComponentIds,
+    excludeComponentIds,
+    legacyLanguages,
+    configPath: config?.path || options.configPath || null,
+  };
+}
+
+module.exports = {
+  LEGACY_INSTALL_TARGETS,
+  normalizeInstallRequest,
+  parseInstallArgs,
+};

@@ -1,0 +1,21 @@
+{
+  "name": "egc",
+  "interface": {
+    "displayName": "EGC - Extended Global Context"
+  },
+  "plugins": [
+    {
+      "name": "egc",
+      "version": "1.1.22",
+      "source": {
+        "source": "local",
+        "path": "../.."
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

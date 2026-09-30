@@ -1,0 +1,10 @@
+{
+  "hooks": {
+    "preToolUse": [
+      {
+        "matcher": "execute_bash",
+        "command": "\"/data/data/com.termux/files/usr/bin/node\" \"/data/data/com.termux/files/home/EGC/dashboard/.amazonq/scripts/hooks/amazonq-guardian-adapter.js\""
+      }
+    ]
+  }
+}

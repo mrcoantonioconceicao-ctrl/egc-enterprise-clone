@@ -1,0 +1,150 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "node .cursor/hooks/session-start.js",
+        "event": "sessionStart",
+        "description": "Load previous context and detect environment"
+      }
+    ],
+    "sessionEnd": [
+      {
+        "command": "node .cursor/hooks/session-end.js",
+        "event": "sessionEnd",
+        "description": "Persist session state and evaluate patterns"
+      }
+    ],
+    "preToolUse": [
+      {
+        "command": "node .cursor/hooks/before-tool-use.js",
+        "event": "preToolUse",
+        "description": "GateGuard Fact-Forcing Gate: require investigation before Write/Shell tool calls"
+      },
+      {
+        "command": "\"/data/data/com.termux/files/usr/bin/node\" \"/data/data/com.termux/files/home/EGC/dashboard/.cursor/scripts/hooks/cursor-crusher-adapter.js\""
+      }
+    ],
+    "beforeFileEdit": [
+      {
+        "command": "EGC_HOOK_EVENT=pre_tool node .cursor/hooks/dashboard-emit.js",
+        "event": "beforeFileEdit",
+        "description": "Emit pre-edit event to EGC Dashboard"
+      }
+    ],
+    "beforeShellExecution": [
+      {
+        "command": "EGC_HOOK_EVENT=pre_tool node .cursor/hooks/dashboard-emit.js",
+        "event": "beforeShellExecution",
+        "description": "Emit pre-bash event to EGC Dashboard"
+      },
+      {
+        "command": "npx block-no-verify@1.1.2",
+        "event": "beforeShellExecution",
+        "description": "Block git hook-bypass flag to protect pre-commit, commit-msg, and pre-push hooks from being skipped"
+      },
+      {
+        "command": "node .cursor/hooks/before-shell-execution.js",
+        "event": "beforeShellExecution",
+        "description": "Tmux dev server blocker, tmux reminder, git push review"
+      },
+      {
+        "command": "\"/data/data/com.termux/files/usr/bin/node\" \"/data/data/com.termux/files/home/EGC/dashboard/.cursor/scripts/hooks/cursor-guardian-adapter.js\""
+      }
+    ],
+    "afterShellExecution": [
+      {
+        "command": "EGC_HOOK_EVENT=post_tool node .cursor/hooks/dashboard-emit.js",
+        "event": "afterShellExecution",
+        "description": "Emit post-bash event to EGC Dashboard"
+      },
+      {
+        "command": "node .cursor/hooks/after-shell-execution.js",
+        "event": "afterShellExecution",
+        "description": "PR URL logging, build analysis"
+      }
+    ],
+    "afterFileEdit": [
+      {
+        "command": "EGC_HOOK_EVENT=post_tool node .cursor/hooks/dashboard-emit.js",
+        "event": "afterFileEdit",
+        "description": "Emit post-edit event to EGC Dashboard"
+      },
+      {
+        "command": "node .cursor/hooks/after-file-edit.js",
+        "event": "afterFileEdit",
+        "description": "Auto-format, TypeScript check, console.log warning, and frontend design-quality reminder"
+      }
+    ],
+    "beforeMCPExecution": [
+      {
+        "command": "node .cursor/hooks/before-mcp-execution.js",
+        "event": "beforeMCPExecution",
+        "description": "MCP audit logging and untrusted server warning"
+      }
+    ],
+    "afterMCPExecution": [
+      {
+        "command": "node .cursor/hooks/after-mcp-execution.js",
+        "event": "afterMCPExecution",
+        "description": "MCP result logging"
+      }
+    ],
+    "beforeReadFile": [
+      {
+        "command": "node .cursor/hooks/before-read-file.js",
+        "event": "beforeReadFile",
+        "description": "Warn when reading sensitive files (.env, .key, .pem)"
+      }
+    ],
+    "beforeSubmitPrompt": [
+      {
+        "command": "node .cursor/hooks/before-submit-prompt.js",
+        "event": "beforeSubmitPrompt",
+        "description": "Detect secrets in prompts (sk-, ghp_, AKIA patterns)"
+      }
+    ],
+    "subagentStart": [
+      {
+        "command": "node .cursor/hooks/subagent-start.js",
+        "event": "subagentStart",
+        "description": "Log agent spawning for observability"
+      }
+    ],
+    "subagentStop": [
+      {
+        "command": "node .cursor/hooks/subagent-stop.js",
+        "event": "subagentStop",
+        "description": "Log agent completion"
+      }
+    ],
+    "beforeTabFileRead": [
+      {
+        "command": "node .cursor/hooks/before-tab-file-read.js",
+        "event": "beforeTabFileRead",
+        "description": "Block Tab from reading secrets (.env, .key, .pem, credentials)"
+      }
+    ],
+    "afterTabFileEdit": [
+      {
+        "command": "node .cursor/hooks/after-tab-file-edit.js",
+        "event": "afterTabFileEdit",
+        "description": "Auto-format Tab edits"
+      }
+    ],
+    "preCompact": [
+      {
+        "command": "node .cursor/hooks/pre-compact.js",
+        "event": "preCompact",
+        "description": "Save state before context compaction"
+      }
+    ],
+    "stop": [
+      {
+        "command": "node .cursor/hooks/stop.js",
+        "event": "stop",
+        "description": "Console.log audit on all modified files"
+      }
+    ]
+  }
+}
