@@ -1,0 +1,159 @@
+#!/usr/bin/env node
+/**
+ * Guardian Auto-Intuition Hook (UserPromptSubmit)
+ *
+ * Detects session-level intent in every user prompt and acts on it by
+ * code before the AI responds:
+ *   session_end    -> saves the state snapshot, mines the transcript for
+ *                     decisions when a provider key exists, and tells the
+ *                     AI the state is already saved
+ *   session_resume -> injects next steps and active decisions from the
+ *                     project state so the AI greets with them
+ *   remember       -> records the user's words verbatim into Active
+ *                     Decisions before the AI even sees the prompt
+ *   history_query  -> injects Do Not Repeat and Active Decisions so the
+ *                     AI answers from project memory
+ *
+ * Intent detection is semantic only: a provider LLM classifies short
+ * messages in any language, with no phrase lists. Without a provider
+ * key nothing is detected and the lifecycle hooks carry the state
+ * guarantees (EGC_INTUITION_LLM=0 disables the classifier).
+ *
+ * Never blocks: on any failure the hook stays silent and exits 0.
+ */
+
+'use strict';
+
+const { resolveGuardianCli, callGuardian } = require('../lib/guardian-bin');
+const { parseInput, runStandalone } = require('../lib/hook-io');
+const {
+  loadState, saveState, appendToSection, extractSection,
+  writeSnapshotToDisk, applyMinedMemory, withStateFileLockSync,
+} = require('../lib/state-snapshot');
+const { getStateDir, detectBranch, resolveStateWrite } = require('../lib/branch-state');
+
+const INTENT_TIMEOUT_MS = 6000;
+const MINE_TIMEOUT_MS = 15000;
+const MAX_REMEMBER_CHARS = 400;
+const MAX_INJECT_CHARS = 1600;
+
+function clip(text, max) {
+  return text.length > max ? `${text.slice(0, max)}...` : text;
+}
+
+function handleSessionEnd(cli, projectPath, transcriptPath) {
+  const savedTo = writeSnapshotToDisk(projectPath);
+
+  let minedNote = '';
+  if (transcriptPath) {
+    const mined = callGuardian(cli, ['mine'], transcriptPath, MINE_TIMEOUT_MS);
+    if (mined && !mined.skip) {
+      const result = applyMinedMemory(projectPath, mined);
+      if (result.added > 0) minedNote = ` ${result.added} decisions and lessons from this session were extracted and merged.`;
+    }
+  }
+
+  return [
+    '=== EGC Session ===',
+    `Project state already saved to ${savedTo}.${minedNote}`,
+    'The user is ending the session: acknowledge briefly, confirm the state is saved, and do not start new work.',
+  ].join('\n');
+}
+
+function handleSessionResume(projectPath) {
+  const state = loadState(projectPath);
+  const next = extractSection(state.content, '## Next Session');
+  const decisions = extractSection(state.content, '## Active Decisions');
+  if (!next && !decisions) return '';
+
+  const parts = ['=== EGC Resume ==='];
+  if (next) parts.push('Next steps:', clip(next, MAX_INJECT_CHARS));
+  if (decisions) parts.push('Active decisions:', clip(decisions, MAX_INJECT_CHARS));
+  parts.push('Greet the user and present these next steps from project memory.');
+  return parts.join('\n');
+}
+
+function handleRemember(projectPath, prompt) {
+  const branch = detectBranch(projectPath);
+  const stateDir = getStateDir(process.env.HOME);
+  const filePath = resolveStateWrite(stateDir, projectPath, branch);
+
+  const saved = withStateFileLockSync(filePath, () => {
+    const state = loadState(projectPath);
+    if (state.undecryptable) return false;
+    const entry = `- ${state.ts.slice(0, 10)}: ${clip(prompt.trim().replace(/\s+/g, ' '), MAX_REMEMBER_CHARS)}`;
+    const result = appendToSection(state.content, '## Active Decisions', [entry]);
+    if (result.added > 0) saveState(state.filePath, result.content);
+    return true;
+  });
+
+  if (!saved) {
+    return [
+      '=== EGC Memory ===',
+      'Could not save: the project state file exists but could not be decrypted, so nothing was written.',
+      'Tell the user their memory was NOT updated and the state file needs manual attention.',
+    ].join('\n');
+  }
+
+  return [
+    '=== EGC Memory ===',
+    'The decision above was already recorded verbatim into the project state by EGC.',
+    'Confirm to the user it is saved, and refine the wording via update_state if useful.',
+  ].join('\n');
+}
+
+function handleHistoryQuery(projectPath) {
+  const state = loadState(projectPath);
+  const avoid = extractSection(state.content, '## Do Not Repeat');
+  const decisions = extractSection(state.content, '## Active Decisions');
+  if (!avoid && !decisions) return '';
+
+  const parts = ['=== EGC History ==='];
+  if (avoid) parts.push('Do not repeat:', clip(avoid, MAX_INJECT_CHARS));
+  if (decisions) parts.push('Active decisions:', clip(decisions, MAX_INJECT_CHARS));
+  parts.push('Answer the user from this project memory.');
+  return parts.join('\n');
+}
+
+// What each detected intent injects into the prompt.
+const INTENT_HANDLERS = {
+  session_end: ({ cli, projectPath, transcriptPath }) => handleSessionEnd(cli, projectPath, transcriptPath),
+  session_resume: ({ projectPath }) => handleSessionResume(projectPath),
+  remember: ({ projectPath, prompt }) => handleRemember(projectPath, prompt),
+  history_query: ({ projectPath }) => handleHistoryQuery(projectPath),
+};
+
+const silent = () => ({ exitCode: 0, stdout: '' });
+
+// The user's prompt, or null when there is none worth reading.
+function promptOf(input) {
+  const prompt = input?.prompt || input?.user_prompt || '';
+  return typeof prompt === 'string' && prompt.trim().length >= 2 ? prompt : null;
+}
+
+function run(inputOrRaw) {
+  const input = parseInput(inputOrRaw);
+  const prompt = promptOf(input);
+  if (!prompt) return silent();
+
+  const cli = resolveGuardianCli();
+  if (!cli) return silent();
+
+  const intent = callGuardian(cli, ['intent'], prompt, INTENT_TIMEOUT_MS)?.intent;
+  const handler = intent && Object.hasOwn(INTENT_HANDLERS, intent) ? INTENT_HANDLERS[intent] : null;
+  if (!handler) return silent();
+
+  const projectPath = input?.cwd || process.env.PWD || process.cwd();
+  const transcriptPath = typeof input?.transcript_path === 'string' ? input.transcript_path : '';
+  try {
+    return { exitCode: 0, stdout: handler({ cli, projectPath, transcriptPath, prompt }) };
+  } catch {
+    return silent();
+  }
+}
+
+module.exports = { run };
+
+if (require.main === module) {
+  runStandalone(run);
+}

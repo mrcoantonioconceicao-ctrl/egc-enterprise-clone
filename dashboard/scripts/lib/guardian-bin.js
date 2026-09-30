@@ -1,0 +1,439 @@
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+const os = require('node:os');
+const { spawnSync } = require('node:child_process');
+
+// Locates the compiled guardian CLI so hooks can enforce validation without
+// the MCP server running. Resolution order: explicit env override, the
+// package-relative layout (repo checkout and npm install share it), then the
+// egc-guardian entry in the MCP configs the user already registered.
+
+function fromEnv() {
+  const explicit = process.env.EGC_GUARDIAN_CLI;
+  if (explicit?.trim() && fs.existsSync(explicit.trim())) return explicit.trim();
+  return null;
+}
+
+function fromPackageLayout() {
+  const candidate = path.join(
+    __dirname, '..', '..',
+    'mcp', 'servers', 'egc-guardian', 'build', 'guardian-cli.js',
+  );
+  return fs.existsSync(candidate) ? candidate : null;
+}
+
+// A repo-local .mcp.json is untrusted content: it travels with whatever
+// repository the user happens to have open, so a malicious repo could ship
+// one that points egc-guardian's entry at a payload script it also ships,
+// which fromMcpConfigs() would then execute as this process's own security
+// validator (RCE). Only the home-level registration files listed in
+// fromMcpConfigs() are trusted here, each one because validate_write's
+// PROTECTED_FILE_PATTERNS/DENIED_PATHS deny writes to it: a repo cannot get
+// content into them just by being cloned. A project's own .mcp.json is
+// deliberately never consulted for this resolution.
+// OpenCode's config directory, resolved the way OpenCode resolves it
+// (xdg-basedir: XDG_CONFIG_HOME, else ~/.config, on every platform).
+function openCodeConfigDir() {
+  return path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'opencode');
+}
+
+// The argv a config entry stores for a server: every other target keeps
+// { command, args }; OpenCode keeps the whole argv as { command: [...] },
+// so that array is read as the args.
+function configuredArgs(server) {
+  if (Array.isArray(server?.args)) return server.args;
+  if (Array.isArray(server?.command)) return server.command;
+  return [];
+}
+
+function fromMcpConfigs() {
+  const configPaths = [
+    path.join(os.homedir(), '.claude.json'),
+    // Antigravity's shared MCP registration file, read by the Antigravity
+    // CLI, the Antigravity IDE and Antigravity 2.0 (mcp-register.js's
+    // "Antigravity" target). Without it an Antigravity-only install (no
+    // ~/.claude.json alongside it) has no config-based fallback here and
+    // fails open silently (2026-07-27 audit, EGC-460/461).
+    path.join(os.homedir(), '.gemini', 'config', 'mcp_config.json'),
+    // The Antigravity CLI's pre-migration file (mcp-register.js's
+    // "Antigravity CLI (pre-migration path)" target), kept for installs
+    // that registered there before the CLI moved to the shared file.
+    path.join(os.homedir(), '.gemini', 'antigravity-cli', 'mcp_config.json'),
+    // OpenCode's real MCP registration files (scripts/lib/mcp-register.js's
+    // "OpenCode" target): the documented opencode.json and the legacy
+    // config.json, both read by OpenCode from ~/.config/opencode on every
+    // platform. The servers live under the `mcp` key there, in OpenCode's
+    // own shape (#1405); the mcpServers shape below is the one every other
+    // JSON target uses.
+    path.join(openCodeConfigDir(), 'opencode.json'),
+    path.join(openCodeConfigDir(), 'config.json'),
+  ];
+
+  // Resolved candidates must live under the user's home directory. This
+  // blocks a tampered home config from pointing at a script planted in the
+  // current project (or /tmp, or anywhere else reachable by whatever
+  // repository is open) even if the config file itself were ever
+  // compromised by some other means.
+  const home = path.resolve(os.homedir());
+
+  for (const configPath of configPaths) {
+    try {
+      const data = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+      const server = data?.mcpServers?.['egc-guardian'] ?? data?.mcp?.['egc-guardian'];
+      // Every other target stores { command, args }; OpenCode stores the
+      // whole argv as { command: [...] }, so the array is read as the args.
+      const args = configuredArgs(server);
+      // Compare against a fixed forward-slash suffix instead of building it
+      // with path.join(), which bakes in the *running* OS's separator
+      // ('\' on Windows). A config value stored with '/' (common even in
+      // Windows configs, and how a config synced from another OS would
+      // read) would never match a '\'-joined suffix, silently disabling
+      // this whole fallback on Windows. Normalizing the candidate's own
+      // separators before comparing means either style in the config matches.
+      const indexJs = [server?.command, ...args].find(
+        a => typeof a === 'string' && a.replaceAll('\\', '/').endsWith('egc-guardian/build/index.js'),
+      );
+      if (!indexJs) continue;
+      const candidate = path.resolve(path.dirname(indexJs), 'guardian-cli.js');
+      if (candidate !== home && !candidate.startsWith(home + path.sep)) continue;
+      if (fs.existsSync(candidate)) return candidate;
+    } catch (_) { /* ignore: unreadable or malformed config, safely fallback to trying the next one */ } // NOSONAR
+  }
+
+  return null;
+}
+
+// Codex CLI (~/.codex/config.toml) is the only supported target that
+// registers MCP servers in TOML, not JSON (scripts/lib/mcp-register.js's
+// registerToml()). @iarna/toml is a devDependency only -- it never ships in
+// the published package -- and this file is copied standalone into install
+// targets with no node_modules of its own (createBashGuardianScriptCopyOperations),
+// so it cannot require() any TOML library. This is a minimal, hand-rolled
+// reader scoped to exactly the shape registerToml() writes: repeated
+// [[mcp_servers]] blocks with name/command/args keys. It is not a general
+// TOML parser -- unrecognized syntax is simply skipped, never thrown, so a
+// config file with other tables/features registerToml() doesn't touch still
+// resolves fine.
+
+// Reverses tomlEscape() in scripts/lib/mcp-register.js: the single-letter
+// escapes and \uXXXX, the two forms that function writes. \UXXXXXXXX is read
+// too, since it is just as valid in a basic string and a hand-edited file
+// could contain it. An unrecognized escape, or one that names no Unicode
+// scalar value (a surrogate, or a code point past the last one), is kept
+// verbatim: TOML allows scalar values only, String.fromCodePoint would throw
+// past the last one, and parseCodexMcpServers() never throws.
+const TOML_ESCAPES = { '\\': '\\', '"': '"', b: '\b', t: '\t', n: '\n', f: '\f', r: '\r' };
+const TOML_ESCAPE_PATTERN = /\\(?:u([\dA-Fa-f]{4})|U([\dA-Fa-f]{8})|(.))/g;
+const MAX_CODE_POINT = 0x10FFFF;
+const FIRST_SURROGATE = 0xD800;
+const LAST_SURROGATE = 0xDFFF;
+
+function isScalarValue(codePoint) {
+  return codePoint <= MAX_CODE_POINT && (codePoint < FIRST_SURROGATE || codePoint > LAST_SURROGATE);
+}
+
+function tomlUnescapeBasicString(raw) {
+  return raw.replaceAll(TOML_ESCAPE_PATTERN, (escape, hex4, hex8, letter) => {
+    const hex = hex4 ?? hex8;
+    if (hex === undefined) return TOML_ESCAPES[letter] ?? escape;
+    const codePoint = Number.parseInt(hex, 16);
+    return isScalarValue(codePoint) ? String.fromCodePoint(codePoint) : escape;
+  });
+}
+
+// Extracts the value of a TOML basic (double-quoted) string, or null if the
+// trimmed text isn't one -- e.g. a literal string ('...'), a bare value, or
+// an already-consumed array element boundary.
+function tomlBasicStringValue(text) {
+  const match = /^"((?:[^"\\]|\\.)*)"$/.exec(text.trim());
+  return match ? tomlUnescapeBasicString(match[1]) : null;
+}
+
+function tomlStringArrayValue(inner) {
+  return inner
+    .split(',')
+    .map(item => item.trim())
+    .filter(Boolean)
+    .map(tomlBasicStringValue)
+    .filter(item => item !== null);
+}
+
+function isMcpServersHeaderLine(line) {
+  return /^\[\[\s*mcp_servers\s*\]\]$/.test(line);
+}
+
+// Parses "key = value" (no interior '=' ambiguity: TOML bare keys can't
+// contain '='). Splitting on the first '=' instead of a single
+// \s*=\s*(.+)$ regex avoids SonarCloud's superlinear-backtracking flag on
+// that combined quantifier shape, and is just as correct here.
+function parseKeyValueLine(line) {
+  const eqIndex = line.indexOf('=');
+  if (eqIndex === -1) return null;
+  const key = line.slice(0, eqIndex).trim();
+  if (!/^[A-Za-z0-9_-]+$/.test(key)) return null;
+  return { key, value: line.slice(eqIndex + 1).trim() };
+}
+
+// Continues a multi-line `args = [ ... ]` array started on a prior line.
+// Returns the still-open pendingArray, or null once the closing ']' lands
+// (at which point current[key] has been set).
+function consumeArrayContinuationLine(current, pendingArray, line) {
+  const closeIndex = line.indexOf(']');
+  if (closeIndex === -1) {
+    pendingArray.raw += ` ${line}`;
+    return pendingArray;
+  }
+  pendingArray.raw += ` ${line.slice(0, closeIndex)}`;
+  current[pendingArray.key] = tomlStringArrayValue(pendingArray.raw);
+  return null;
+}
+
+// Parses a "key = value" line within an open [[mcp_servers]] block. Returns
+// a pendingArray descriptor if the value opens a multi-line array, else null
+// (the value -- string or single-line array -- was already assigned).
+function consumeKeyValueLine(current, line) {
+  const kv = parseKeyValueLine(line);
+  if (!kv) return null;
+  const { key, value } = kv;
+
+  if (!value.startsWith('[')) {
+    const str = tomlBasicStringValue(value);
+    if (str !== null) current[key] = str;
+    return null;
+  }
+
+  const inner = value.slice(1);
+  const closeIndex = inner.indexOf(']');
+  if (closeIndex === -1) return { key, raw: inner };
+  current[key] = tomlStringArrayValue(inner.slice(0, closeIndex));
+  return null;
+}
+
+// Scans for [[mcp_servers]] blocks and returns each as a plain object of its
+// string/string-array keys. Any other table header ([foo] or [[foo]] with a
+// different name) closes the current block without being parsed itself --
+// registerToml() never writes anything else, but a hand-edited file might.
+function parseCodexMcpServers(content) {
+  const servers = [];
+  let current = null;
+  let pendingArray = null; // { key, raw } while a multi-line array is open
+
+  const closeBlock = () => {
+    if (current) servers.push(current);
+    current = null;
+  };
+
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+
+    if (pendingArray) {
+      pendingArray = consumeArrayContinuationLine(current, pendingArray, line);
+      continue;
+    }
+    if (isMcpServersHeaderLine(line)) {
+      closeBlock();
+      current = {};
+      continue;
+    }
+    if (line.startsWith('[')) {
+      closeBlock();
+      continue;
+    }
+    if (!current) continue;
+
+    pendingArray = consumeKeyValueLine(current, line);
+  }
+  closeBlock();
+  return servers;
+}
+
+function fromCodexToml() {
+  const configPath = path.join(os.homedir(), '.codex', 'config.toml');
+  let content;
+  try {
+    content = fs.readFileSync(configPath, 'utf8');
+  } catch {
+    return null;
+  }
+
+  // parseCodexMcpServers() never throws for any string input (it skips
+  // unrecognized syntax rather than raising), so this has no try/catch --
+  // one would be dead code, unreachable by construction.
+  const servers = parseCodexMcpServers(content);
+
+  const server = servers.find(s => s.name === 'egc-guardian');
+  if (!server) return null;
+  const args = Array.isArray(server.args) ? server.args : [];
+  const indexJs = [server.command, ...args].find(
+    a => typeof a === 'string' && a.replaceAll('\\', '/').endsWith('egc-guardian/build/index.js'),
+  );
+  if (!indexJs) return null;
+
+  // Same home-scoping guard as fromMcpConfigs(): a resolved path must live
+  // under the user's home directory, closing off the same RCE shape (a
+  // tampered/synced config pointing resolution at an attacker-controlled
+  // script elsewhere).
+  const home = path.resolve(os.homedir());
+  const candidate = path.resolve(path.dirname(indexJs), 'guardian-cli.js');
+  if (candidate !== home && !candidate.startsWith(home + path.sep)) return null;
+  return fs.existsSync(candidate) ? candidate : null;
+}
+
+// Last-resort strategy for installs with no MCP config file of their own to
+// trust (Copilot, CodeBuddy: guardian-bin.js is copied standalone into
+// their tree with no fixed path relationship back to the original package,
+// unlike fromPackageLayout()'s repo/npm-install case). scripts/lib/install/
+// apply.js's writeGuardianCliMarker() records the real package root here on
+// every install/repair, so any standalone copy can read it back.
+//
+// 2026-07-27 internal design review (EGC-465): deliberately does NOT require
+// the resolved candidate to live under the user's home directory, unlike
+// fromMcpConfigs()/fromCodexToml() above. Those two guard against a
+// synced/tampered CONFIG FILE pointing resolution somewhere attacker-
+// controlled. Here the marker file itself is the trust boundary (protected
+// in PROTECTED_FILE_PATTERNS, only ever written by this package's own
+// installer) -- its packageRoot value is expected to legitimately point
+// outside $HOME for a system-wide Node install with no version manager
+// (`apt install nodejs` + `sudo npm install -g`, common in CI runners and
+// containers, puts `npm root -g` under /usr/lib/node_modules). Restricting
+// the marker's content to $HOME would silently defeat this fix for exactly
+// the deployment shape it exists to cover.
+function fromEgcHomeMarker() {
+  const markerPath = path.join(os.homedir(), '.egc', 'guardian-cli-path.json');
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
+  } catch {
+    return null;
+  }
+
+  const packageRoot = parsed?.packageRoot;
+  if (typeof packageRoot !== 'string' || !packageRoot.trim()) return null;
+
+  const candidate = path.join(packageRoot, 'mcp', 'servers', 'egc-guardian', 'build', 'guardian-cli.js');
+  return fs.existsSync(candidate) ? candidate : null;
+}
+
+function resolveGuardianCli() {
+  return fromEnv() || fromPackageLayout() || fromMcpConfigs() || fromCodexToml() || fromEgcHomeMarker();
+}
+
+// Invokes the guardian CLI with the payload on stdin, never in argv.
+// Untrusted content (prompts, commands, paths) must not travel as command
+// arguments where a leading dash could be parsed as a flag. argv carries
+// only the fixed mode and literal flags. Returns { ok: true, value } with
+// the parsed JSON, or { ok: false, kind, detail } saying what went wrong:
+// 'timeout' (no answer within timeoutMs), 'unstartable' (the process could
+// not be spawned), 'crash' (a non-zero exit or a signal) or 'unreadable'
+// (an empty answer, or one that is not JSON). A caller that must not run
+// without a verdict reads the kind; the others use callGuardian below.
+function callGuardianVerdict(cli, args, input, timeoutMs) {
+  const result = spawnSync(process.execPath, [cli, ...args], {
+    input: String(input ?? ''),
+    encoding: 'utf8',
+    timeout: timeoutMs,
+    // SIGKILL, so a validator that traps or ignores SIGTERM still ends when
+    // the budget does: the call is synchronous, and the budget is a promise.
+    killSignal: 'SIGKILL',
+  });
+  return classifyGuardianResult(result);
+}
+
+// What the spawn result says, read in the order that tells the truth: the
+// budget first, then the output limit, then a process that never ran, then
+// one that ran and failed, then the answer itself. result.error alone does
+// not mean the process never started (EPIPE after the child closed stdin
+// comes with a status), so status and signal are read before the error.
+function classifyGuardianResult(result) {
+  const code = result.error?.code;
+  if (code === 'ETIMEDOUT') return { ok: false, kind: 'timeout', detail: 'no answer within the budget' };
+  if (code === 'ENOBUFS') return { ok: false, kind: 'unreadable', detail: 'an answer past the output limit' };
+  if (result.status === null && result.signal === null) {
+    return { ok: false, kind: 'unstartable', detail: String(result.error?.message ?? code ?? 'no process') };
+  }
+  if (result.status !== 0) {
+    const detail = result.status === null ? `signal ${result.signal}` : `exit code ${result.status}`;
+    return { ok: false, kind: 'crash', detail };
+  }
+  if (!result.stdout) return { ok: false, kind: 'unreadable', detail: 'an empty answer' };
+  try {
+    return { ok: true, value: JSON.parse(result.stdout) };
+  } catch {
+    return { ok: false, kind: 'unreadable', detail: 'something that is not JSON' };
+  }
+}
+
+// Why a call gave no verdict, in words a user reads: `failure` is what
+// callGuardianVerdict returned when it was not ok.
+function guardianFailureReason(failure, timeoutMs) {
+  switch (failure.kind) {
+    case 'timeout':
+      return `the validator did not answer within ${timeoutMs / 1000} seconds`;
+    case 'unstartable':
+      return `the validator could not be started (${failure.detail})`;
+    case 'crash':
+      return `the validator stopped with ${failure.detail}`;
+    case 'unreadable':
+      return `the validator answered ${failure.detail}, which this hook could not read`;
+    default:
+      return 'the validator gave no verdict';
+  }
+}
+
+// The most of its input a hook that gates a command or a write reads.
+const MAX_HOOK_INPUT_BYTES = 1024 * 1024;
+
+// A hook's input: at most MAX_HOOK_INPUT_BYTES of it, decoded once, and
+// whether any was cut. Bytes are counted, not UTF-16 units, so a multibyte
+// input past the size is cut as an ASCII one is; a stream that fails before
+// its end counts as cut, since what was read is not the whole input.
+function readHookInput(onRead, stream = process.stdin) {
+  const chunks = [];
+  let kept = 0;
+  let truncated = false;
+  let done = false;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    onRead({ raw: Buffer.concat(chunks).toString('utf8'), truncated });
+  };
+  stream.on('data', chunk => {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    const room = MAX_HOOK_INPUT_BYTES - kept;
+    if (bytes.length > room) truncated = true;
+    if (room > 0) {
+      const part = bytes.subarray(0, room);
+      chunks.push(part);
+      kept += part.length;
+    }
+  });
+  stream.on('end', finish);
+  stream.on('error', () => {
+    truncated = true;
+    finish();
+  });
+}
+
+// The parsed JSON, or null on any failure, for the callers that still fail
+// open: the prompt router and the intuition hook, the memory miner and
+// auto-learn.
+function callGuardian(cli, args, input, timeoutMs) {
+  const answer = callGuardianVerdict(cli, args, input, timeoutMs);
+  return answer.ok ? answer.value : null;
+}
+
+module.exports = {
+  resolveGuardianCli,
+  callGuardian,
+  callGuardianVerdict,
+  guardianFailureReason,
+  MAX_HOOK_INPUT_BYTES,
+  readHookInput,
+  fromEnv,
+  fromPackageLayout,
+  fromMcpConfigs,
+  fromCodexToml,
+  fromEgcHomeMarker,
+};

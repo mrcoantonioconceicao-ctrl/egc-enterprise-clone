@@ -8,7 +8,7 @@ const os      = require('os');
 const { execSync, execFileSync } = require('child_process');
 const { KNOWN_IDES, createAccumulator } = require('./accumulator');
 const { TOKEN_HEADER, createOpsHandler, isLoopbackHost, isPanelOrigin, loadOrCreateOpsToken, tokensMatch } = require('./ops');
-const { SUPPORTED_INSTALL_TARGETS } = require('../scripts/lib/install-manifests');
+const { SUPPORTED_INSTALL_TARGETS } = require('./scripts/lib/install-manifests');
 const { PORT } = require('./port');
 const PUBLIC = path.join(__dirname, 'public');
 const CFG    = path.join(__dirname, 'config.json');
@@ -81,7 +81,7 @@ const SERVER_START = Date.now();
 // hand-rolled ~/.egc/state/*.md parser that lived here have all been removed;
 // operations.state() returns plain JSON {decisions, lessons, patterns, dbPath}
 // and handles path resolution and store lifecycle internally.
-const { state: queryStateOp } = require('../scripts/lib/operations/index');
+const { state: queryStateOp } = require('./scripts/lib/operations/index');
 
 async function queryEgcStats() {
   try {

@@ -1,0 +1,454 @@
+#!/usr/bin/env node
+/**
+ * Refactored EGC installer runtime.
+ *
+ * Keeps the legacy language-based install entrypoint intact while moving
+ * target-specific mutation logic into testable Node code.
+ */
+
+const fs = require('node:fs');
+const os = require('node:os');
+
+
+const {
+  SUPPORTED_INSTALL_TARGETS,
+  listLegacyCompatibilityLanguages,
+} = require('./lib/install-manifests');
+const {
+  LEGACY_INSTALL_TARGETS,
+  normalizeInstallRequest,
+  parseInstallArgs,
+} = require('./lib/install/request');
+
+function getHelpText() {
+  const languages = listLegacyCompatibilityLanguages();
+
+  return `
+Usage: install.sh [--target <${LEGACY_INSTALL_TARGETS.join('|')}>] [--dry-run] [--json] <language> [<language> ...]
+       install.sh [--target <${SUPPORTED_INSTALL_TARGETS.join('|')}>] [--dry-run] [--json] --profile <name> [--with <component>]... [--without <component>]...
+       install.sh [--target <${SUPPORTED_INSTALL_TARGETS.join('|')}>] [--dry-run] [--json] --modules <id,id,...> [--with <component>]... [--without <component>]...
+       install.sh [--dry-run] [--json] --config <path>
+
+Targets (legacy language install):
+  egc       (default) - Install EGC into ~/.gemini/
+  cursor      - Install into ./.cursor/
+  antigravity - Install into ./.agents/
+
+Targets (profile / modules install: all supported targets):
+  ${SUPPORTED_INSTALL_TARGETS.join(', ')}
+
+Options:
+  --profile <name>    Resolve and install a manifest profile
+  --modules <ids>     Resolve and install explicit module IDs
+  --with <component>  Include a user-facing install component
+  --without <component>
+                      Exclude a user-facing install component
+  --config <path>     Load install intent from egc-install.json
+  --dry-run    Show the install plan without copying files
+  --json       Emit machine-readable plan/result JSON
+  --require-detected
+               Fail instead of installing when the target tool is not
+               detected on this machine (strict automation)
+  --allow-undetected
+               Skip the not-detected warning and prompt entirely
+               (deliberate provisioning before the tool is installed)
+  --prompt-library
+               Bare install only: add the prompt library (agents, skills,
+               commands, rules) to every detected tool without asking
+  --no-prompt-library
+               Bare install only: skip the prompt-library question
+  --help       Show this help text
+
+Available languages:
+${languages.map(language => `  - ${language}`).join('\n')}
+`;
+}
+
+function showHelp(exitCode = 0) {
+  console.log(getHelpText());
+  process.exit(exitCode);
+}
+
+function printModulePlanDetails(plan) {
+  if (plan.mode === 'legacy-compat') {
+    console.log(`Legacy languages: ${plan.legacyLanguages.join(', ')}`);
+  }
+  console.log(`Profile: ${plan.profileId || '(custom modules)'}`); // NOSONAR jssecurity:S8689
+  console.log(`Included components: ${plan.includedComponentIds.join(', ') || '(none)'}`);
+  console.log(`Excluded components: ${plan.excludedComponentIds.join(', ') || '(none)'}`);
+  console.log(`Requested modules: ${plan.requestedModuleIds.join(', ') || '(none)'}`);
+  console.log(`Selected modules: ${plan.selectedModuleIds.join(', ') || '(none)'}`);
+  if (plan.skippedModuleIds.length > 0) {
+    console.log(`Skipped modules: ${plan.skippedModuleIds.join(', ')}`);
+  }
+  if (plan.excludedModuleIds.length > 0) {
+    console.log(`Excluded modules: ${plan.excludedModuleIds.join(', ')}`);
+  }
+}
+
+function printHumanPlan(plan, dryRun) {
+  console.log(`${dryRun ? 'Dry-run install plan' : 'Applying install plan'}:\n`);
+  console.log(`Mode: ${plan.mode}`);
+  console.log(`Target: ${plan.target}`); // NOSONAR jssecurity:S8689
+  console.log(`Adapter: ${plan.adapter.id}`);
+  console.log(`Install root: ${plan.installRoot}`);
+  console.log(`Install-state: ${plan.installStatePath}`);
+  if (plan.mode === 'legacy') {
+    console.log(`Languages: ${plan.languages.join(', ')}`);
+  } else {
+    printModulePlanDetails(plan);
+    if (plan.selectedModuleIds.length === 0 && plan.skippedModuleIds.length > 0) {
+      process.stderr.write(
+        `Warning: all requested modules were skipped for target '${plan.target}'. ` +
+        `The modules or their dependencies may not support this target.\n`
+      );
+    }
+  }
+  console.log(`Operations: ${plan.operations.length}`);
+
+  if (plan.warnings.length > 0) {
+    console.log('\nWarnings:');
+    for (const warning of plan.warnings) {
+      console.log(`- ${warning}`);
+    }
+  }
+
+  console.log('\nPlanned file operations:');
+  for (const operation of plan.operations) {
+    console.log(`- ${operation.sourceRelativePath} -> ${operation.destinationPath}`);
+  }
+
+  printRetirements(plan, dryRun);
+  printLegacyLinks(plan, dryRun);
+  printShapeTransitions(plan, dryRun);
+
+  if (!dryRun) {
+    console.log(`\nDone. Install-state written to ${plan.installStatePath}`);
+  }
+}
+
+// Files an earlier EGC install wrote that this plan no longer covers and
+// the target removes (for OpenCode, the egc-universal package files that
+// broke the config directory, #1396). Listed by the dry run, reported by
+// the apply.
+function printRetirements(plan, dryRun) {
+  const files = dryRun ? plan.retirements : plan.retiredFiles;
+  if (!files || files.length === 0) return;
+  console.log(dryRun
+    ? '\nFiles to retire (written by an earlier EGC install, no longer part of this target):'
+    : '\nRetired files:');
+  for (const file of files) {
+    console.log(`- ${dryRun ? '' : 'retired file: '}${file.destinationPath}`);
+  }
+}
+
+// The links from EGC's own June 2026 layout (one link per Antigravity CLI
+// skill into the Gemini home copy) that this run replaces, or would
+// replace, with real files (#1400). Any other link is refused as before.
+function printLegacyLinks(plan, dryRun) {
+  const links = dryRun ? plan.legacyLinks : plan.migratedLegacyLinks;
+  if (!links || links.length === 0) return;
+  console.log(dryRun
+    ? '\nLegacy links to migrate (EGC\'s own layout from June 2026, each replaced by the real files):'
+    : '\nMigrated legacy links:');
+  for (const link of links) {
+    console.log(`- ${dryRun ? '' : 'migrated legacy link: '}${link.linkPath} (pointed at ${link.resolvedTo})`);
+  }
+}
+
+// Destinations whose source changed shape between installs: a file that
+// became a source directory, or back, keeps its name but not its shape at
+// the installed destination. The apply retires those files through the same
+// identity check the retirement path uses and refuses anything else; the dry
+// run lists the resolvable transitions and every refusal so the whole state
+// is visible before anything runs.
+function printShapeTransitions(plan, dryRun) {
+  const transitions = plan.shapeTransitions || [];
+  const refusals = plan.shapeRefusals || [];
+  if (transitions.length > 0) {
+    console.log(dryRun
+      ? '\nShape transitions (a source changed between a file and a directory):'
+      : '\nShape transitions applied:');
+    for (const transition of transitions) {
+      const direction = transition.type === 'file-to-dir'
+        ? 'file retired, written as a directory'
+        : 'directory retired, written as a file';
+      console.log(`- ${transition.destinationPath}: ${direction}`);
+    }
+  }
+  if (dryRun && refusals.length > 0) {
+    console.log('\nShape transitions that would refuse the install:');
+    for (const refusal of refusals) {
+      console.log(`- ${refusal.destinationPath}: ${refusal.reason}`);
+    }
+  }
+}
+
+function resolveInstallConfig(options, { findDefaultInstallConfigPath, loadInstallConfig }) {
+  const defaultConfigPath = (options.configPath || options.languages.length > 0)
+    ? null
+    : findDefaultInstallConfigPath({ cwd: process.cwd() });
+  if (options.configPath) return loadInstallConfig(options.configPath, { cwd: process.cwd() });
+  if (defaultConfigPath) return loadInstallConfig(defaultConfigPath, { cwd: process.cwd() });
+  return null;
+}
+
+function hasInstallSelection(options, config) {
+  return Boolean(
+    config ||
+    options.profileId ||
+    options.moduleIds.length > 0 ||
+    options.includeComponentIds.length > 0 ||
+    options.excludeComponentIds.length > 0 ||
+    options.languages.length > 0
+  );
+}
+
+// Best-effort: a repo-detection failure here must not fail the whole
+// install. Shared by both call sites (the bare-`egc install` delegation
+// branch and the normal apply path below) so the commit-privacy promise is
+// kept the same way from either one.
+function configureCommitPrivacyFilterBestEffort(log, onError) {
+  try {
+    const { applyCommitPrivacyFilterCli } = require('./lib/memory-filters');
+    applyCommitPrivacyFilterCli({
+      projectDir: process.cwd(),
+      scriptPath: require('node:path').join(__dirname, 'check-state-leak.js'),
+      log,
+    });
+  } catch (err) {
+    onError(err);
+  }
+}
+
+// A bare "egc install" is the README Quick Start path. The no-argument
+// flow is already defined by the shipped onboarding installers, so run
+// them instead of failing; the env guard stops the wrappers from
+// recursing back into this script.
+// The bare-install flags the shell installers understand. Kept apart from
+// the spawn so the argument shape has a test of its own.
+function legacyInstallerArgs(options = {}) {
+  if (options.promptLibrary === true) return ['--prompt-library'];
+  if (options.promptLibrary === false) return ['--no-prompt-library'];
+  return [];
+}
+
+function delegateToLegacyInstaller(options = {}) {
+  const path = require('node:path');
+  const { spawnSync } = require('node:child_process');
+  const rootDir = path.join(__dirname, '..');
+  const passthrough = legacyInstallerArgs(options);
+
+  // Must run here, before the spawnSync below: that call hands off to
+  // install.sh/install.ps1 with cwd forced to rootDir (the package's own
+  // install location, not the user's project), so their own copy of this
+  // same setup silently targets the wrong directory (cubic review, PR
+  // #1122). process.cwd() is still the real user directory at this
+  // point -- this script never chdirs on its own.
+  configureCommitPrivacyFilterBestEffort(
+    msg => console.log(`  ${msg}`),
+    err => console.error(`Warning: commit-privacy filter setup failed: ${err.message}`)
+  );
+
+  const wrapper = process.platform === 'win32'
+    ? { cmd: 'powershell', args: ['-ExecutionPolicy', 'Bypass', '-File', path.join(rootDir, 'scripts', 'install.ps1'), ...passthrough] }
+    : { cmd: 'bash', args: [path.join(rootDir, 'scripts', 'install.sh'), ...passthrough] };
+  const spawned = spawnSync(wrapper.cmd, wrapper.args, {
+    cwd: rootDir,
+    stdio: 'inherit',
+    env: { ...process.env, EGC_INSTALL_DELEGATED: '1' },
+  });
+  if (spawned.error) {
+    process.stderr.write(`Error: failed to launch ${wrapper.cmd}: ${spawned.error.message}\n`);
+  }
+  process.exit(spawned.status === null ? 1 : spawned.status);
+}
+
+function regenerateTopologyCache() {
+  // The cache lives next to the code (internal/registry). A root-owned
+  // global npm prefix cannot take it, and nothing in the install needs it
+  // (only the optional orchestration router reads it), so a read-only
+  // install directory is a note, not a warning.
+  const rootDir = require('node:path').join(__dirname, '..');
+  try {
+    fs.accessSync(rootDir, fs.constants.W_OK);
+  } catch {
+    console.log('  note: topology cache not regenerated (read-only install directory)');
+    return;
+  }
+  try {
+    const { discover } = require('./runtime/discovery');
+    discover();
+  } catch (err) {
+    console.error(`Warning: Failed to regenerate topology cache: ${err.message}`);
+  }
+}
+
+const UNDETECTED_ISSUE_CODE = 'ide-not-detected';
+
+function undetectedTargetIssues(plan) {
+  return (plan.validationIssues || []).filter(issue => issue.code === UNDETECTED_ISSUE_CODE);
+}
+
+// Reads one line from the terminal, synchronously. The caller only reaches
+// this when stdin AND stdout are real TTYs, so this can never hang a pipe:
+// a prompt reading from a dead pipe is exactly the 1.1.17 doctor regression
+// this guard exists to never repeat.
+function promptYesNo(question) {
+  process.stdout.write(question);
+  const buffer = Buffer.alloc(256);
+  let bytesRead;
+  try {
+    bytesRead = fs.readSync(0, buffer, 0, buffer.length);
+  } catch (_error) { // NOSONAR: an unreadable stdin answers the safe default, no
+    return false;
+  }
+  const answer = buffer.toString('utf8', 0, bytesRead).trim().toLowerCase();
+  return answer === 'y' || answer === 'yes';
+}
+
+// Strips already-surfaced not-detected issues from BOTH plan shapes: the
+// flattened warning strings printHumanPlan() renders, and the structured
+// validationIssues the --json output embeds verbatim. Missing either one
+// leaves the issue visible through the shape this call site does not touch.
+function silenceUndetectedIssues(plan, issues) {
+  const silenced = new Set(issues.map(issue => issue.message));
+  plan.warnings = (plan.warnings || []).filter(warning => !silenced.has(warning));
+  plan.validationIssues = (plan.validationIssues || []).filter(issue => !silenced.has(issue.message));
+}
+
+// The detection ladder for a target whose tool is absent from this machine:
+// --require-detected refuses outright (strict automation); --allow-undetected
+// installs silently (deliberate provisioning); a human at a real terminal is
+// asked once, defaulting to No; and a non-interactive run keeps the historic
+// behavior, warn and proceed, so no existing script changes behavior.
+function enforceTargetDetection(plan, options) {
+  const issues = undetectedTargetIssues(plan);
+  if (issues.length === 0) {
+    return;
+  }
+
+  if (options.requireDetected) {
+    throw new Error(`--require-detected: ${issues[0].message.split('\n')[0]}`);
+  }
+
+  if (options.allowUndetected) {
+    silenceUndetectedIssues(plan, issues);
+    return;
+  }
+
+  if (!options.dryRun && !options.json && process.stdin.isTTY && process.stdout.isTTY) {
+    console.log(`\n${issues[0].message}`);
+    if (!promptYesNo('Install anyway? [y/N] ')) {
+      console.log('Aborted: the target tool was not detected and installation was declined.');
+      process.exit(1);
+    }
+    // Already shown above as part of the prompt: printHumanPlan() must not
+    // repeat it a second time under "Warnings:" once the user said yes.
+    silenceUndetectedIssues(plan, issues);
+  }
+}
+
+function emitDryRunPlan(options, plan) {
+  if (options.json) {
+    console.log(JSON.stringify({ dryRun: true, plan }, null, 2)); // NOSONAR jssecurity:S8689
+    return;
+  }
+  printHumanPlan(plan, true);
+}
+
+function emitInstallResult(options, result) {
+  if (options.json) {
+    console.log(JSON.stringify({ dryRun: false, result }, null, 2)); // NOSONAR jssecurity:S8689
+    return;
+  }
+  printHumanPlan(result, false);
+  const { launchDashboard, shouldAutoLaunch } = require('./lib/dashboard-launch');
+  if (shouldAutoLaunch()) {
+    launchDashboard({ log: msg => console.log(`  ${msg}`) }).catch(error => {
+      console.error(`  Dashboard startup skipped: ${error.message}`);
+    });
+  }
+}
+
+function main() {
+  try {
+    const options = parseInstallArgs(process.argv);
+
+    if (options.help) {
+      showHelp(0);
+    }
+
+    const {
+      findDefaultInstallConfigPath,
+      loadInstallConfig,
+    } = require('./lib/install/config');
+    const { applyInstallPlan } = require('./lib/install-executor');
+    const { createInstallPlanFromRequest } = require('./lib/install/runtime');
+
+    const config = resolveInstallConfig(options, { findDefaultInstallConfigPath, loadInstallConfig });
+    const hasSelection = hasInstallSelection(options, config);
+    if (hasSelection && options.promptLibrary !== null) {
+      throw new Error(
+        '--prompt-library and --no-prompt-library apply to the bare "egc install" only: '
+        + 'with --profile, --modules, --with, --without, --config or a language the selection is already explicit'
+      );
+    }
+    if (!hasSelection && !options.dryRun && !options.json && !process.env.EGC_INSTALL_DELEGATED) {
+      delegateToLegacyInstaller(options);
+    }
+    const request = normalizeInstallRequest({
+      ...options,
+      config,
+    });
+    const homeDir = process.env.HOME || process.env.USERPROFILE || os.homedir();
+    const plan = createInstallPlanFromRequest(request, {
+      projectRoot: process.cwd(),
+      homeDir,
+      claudeRulesDir: process.env.GEMINI_RULES_DIR || null,
+    });
+
+    enforceTargetDetection(plan, options);
+
+    if (options.dryRun) {
+      const { collectShapeTransitions, findLegacyLinks, retirableFiles } = require('./lib/install/apply');
+      plan.legacyLinks = findLegacyLinks(plan);
+      // The same test the apply runs: a file the person replaced is not
+      // listed, because it would not be removed.
+      plan.retirements = retirableFiles(plan);
+      // Same again for destinations whose source changed shape: the apply
+      // resolves a transition only when every file passes identity, so the
+      // dry run lists the resolvable transitions and every refusal.
+      const shapeResult = collectShapeTransitions(plan);
+      plan.shapeTransitions = shapeResult.transitions;
+      plan.shapeRefusals = shapeResult.refusals;
+      emitDryRunPlan(options, plan);
+      return;
+    }
+
+    const result = applyInstallPlan(plan);
+
+    // README promises memory "never gets committed to git" unconditionally.
+    // Before this call, only `egc init` configured the filter that keeps
+    // that promise -- `egc install --target X` (this path) and the bare
+    // `egc install` wrapper scripts never did, so a user following the
+    // README's own quick-start command got no protection (2026-08-01
+    // audit finding).
+    configureCommitPrivacyFilterBestEffort(
+      options.json ? () => {} : msg => console.log(`  ${msg}`),
+      err => { if (!options.json) console.error(`Warning: commit-privacy filter setup failed: ${err.message}`); }
+    );
+
+    regenerateTopologyCache();
+    emitInstallResult(options, result);
+  } catch (error) {
+    process.stderr.write(`Error: ${error.message}\n${getHelpText()}`);
+    process.exit(1);
+  }
+}
+
+if (require.main === module) {
+  main();
+}
+
+module.exports = { legacyInstallerArgs };

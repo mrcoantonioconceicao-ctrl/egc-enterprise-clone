@@ -1,0 +1,155 @@
+#!/usr/bin/env node
+
+const os = require('node:os');
+const { repairInstalledStates } = require('./lib/install-lifecycle');
+const { SUPPORTED_INSTALL_TARGETS } = require('./lib/install-manifests');
+const { reinstallAllPlugins, listInstalledPlugins } = require('./lib/plugin-registry');
+const { parseTargetArgs } = require('./lib/cli-target-args');
+
+function showHelp(exitCode = 0) {
+  console.log(`
+Usage: node scripts/repair.js [--target <${SUPPORTED_INSTALL_TARGETS.join('|')}>] [--repo-root <path>] [--dry-run] [--json]
+
+Rebuild EGC-managed files recorded in install-state for the current context.
+Also reinstalls all plugins from the plugin lock file.
+
+Without --repo-root, the reference repo is always wherever the running \`egc\`
+binary lives (the published npm package for a global install) -- pass the
+same --repo-root used with \`egc auto-update\` if the install was synced from
+a local dev checkout instead, or repair will report source files the npm
+package doesn't have yet as unrepairable.
+`);
+  process.exit(exitCode);
+}
+
+function parseArgs(argv) {
+  return parseTargetArgs(argv, { supportsDryRun: true });
+}
+
+// A pruned entry is healed, not broken: its source left the reference repo,
+// the stale install-state record was dropped, and the installed file stays
+// on disk (unmanaged from now on).
+function printPrunedEntries(entry, dryRun) {
+  const prunedEntries = dryRun ? entry.plannedPrunes : entry.prunedPaths;
+  if ((prunedEntries?.length ?? 0) === 0) {
+    return;
+  }
+  console.log(`  ${dryRun ? 'Planned prunes' : 'Pruned stale entries'}: ${prunedEntries.length}`);
+  for (const item of prunedEntries) {
+    console.log(`    - ${item}: source left the reference repo; entry removed, installed file kept`);
+  }
+}
+
+// Each item carries its own reason, because the two causes need different
+// actions: a renamed-away source means the install-state is stale, while an
+// execution failure usually means permissions.
+function printUnrepairableEntries(entry) {
+  if ((entry.unrepairable?.length ?? 0) === 0) {
+    return;
+  }
+  console.log(`  Unrepairable: ${entry.unrepairable.length}`);
+  for (const item of entry.unrepairable) {
+    console.log(`    - ${item.path} [${item.cause}]: ${item.reason}`);
+  }
+}
+
+function printHuman(result) {
+  if (result.manifestError) {
+    console.log(`Install manifests refused: ${result.manifestError}`);
+  }
+  if (result.results.length === 0) {
+    console.log('No EGC install-state files found for the current home/project context.');
+    return;
+  }
+
+  console.log('Repair summary:\n');
+  for (const entry of result.results) {
+    printRepairEntry(entry, result.dryRun);
+  }
+  console.log(`\n${formatRepairSummary(result)}`);
+}
+
+function printRepairEntry(entry, dryRun) {
+  console.log(`- ${entry.adapter.id}`);
+  console.log(`  Status: ${entry.status.toUpperCase()}`);
+  console.log(`  Install-state: ${entry.installStatePath}`);
+
+  // An unreadable install-state entry says nothing about repairs, so it
+  // still reports only the error. An entry with orphaned sources is a
+  // different situation: work was done, and the count must not be hidden.
+  if (entry.error && (entry.unrepairable?.length ?? 0) === 0) {
+    console.log(`  Error: ${entry.error}`);
+    return;
+  }
+
+  const paths = dryRun ? entry.plannedRepairs : entry.repairedPaths;
+  console.log(`  ${dryRun ? 'Planned repairs' : 'Repaired paths'}: ${paths.length}`);
+  printPrunedEntries(entry, dryRun);
+  printUnrepairableEntries(entry);
+}
+
+function formatRepairSummary(result) {
+  const prunedCount = result.dryRun ? result.summary.plannedPruneCount : result.summary.prunedCount;
+  const pruneLabel = result.dryRun ? 'planned-prunes' : 'pruned';
+  const pruned = prunedCount ? `, ${pruneLabel}=${prunedCount}` : '';
+  const unrepairable = result.summary.unrepairableCount
+    ? `, unrepairable=${result.summary.unrepairableCount}`
+    : '';
+  const repairLabel = result.dryRun ? 'planned' : 'repaired';
+  const repairCount = result.dryRun ? result.summary.plannedRepairCount : result.summary.repairedCount;
+  return `Summary: checked=${result.summary.checkedCount}, ${repairLabel}=${repairCount}, errors=${result.summary.errorCount}${pruned}${unrepairable}`;
+}
+
+function executePluginRepairs(options) {
+  if (options.dryRun) return [];
+  const plugins = listInstalledPlugins();
+  if (plugins.length === 0) return [];
+  return reinstallAllPlugins();
+}
+
+function printOutput(result, pluginResults, options) {
+  if (options.json) {
+    if (pluginResults.length > 0) {
+      result.pluginRepairs = pluginResults;
+    }
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  printHuman(result);
+  if (pluginResults.length > 0) {
+    console.log('\nPlugin reinstall:\n');
+    for (const p of pluginResults) {
+      const icon = p.success ? '\u2713' : '\u2717';
+      console.log(`  ${icon} ${p.name}${p.success ? '' : ': ' + (p.errors || []).join(', ')}`);
+    }
+  }
+}
+
+function main() {
+  try {
+    const options = parseArgs(process.argv);
+    if (options.help) {
+      showHelp(0);
+    }
+
+    const result = repairInstalledStates({
+      repoRoot: options.repoRoot || require('node:path').join(__dirname, '..'),
+      homeDir: process.env.HOME || process.env.USERPROFILE || os.homedir(),
+      projectRoot: process.cwd(),
+      targets: options.targets,
+      dryRun: options.dryRun,
+    });
+    
+    const pluginResults = executePluginRepairs(options);
+    printOutput(result, pluginResults, options);
+
+    const hasErrors = result.summary.errorCount > 0;
+    const pluginErrors = pluginResults.filter(p => !p.success).length;
+    process.exitCode = (hasErrors || pluginErrors > 0) ? 1 : 0;
+  } catch (error) {
+    console.error(`Error: ${error.message}`);
+    process.exit(1);
+  }
+}
+
+main();

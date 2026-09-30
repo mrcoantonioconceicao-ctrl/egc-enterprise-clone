@@ -1,0 +1,449 @@
+#!/usr/bin/env node
+
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { spawnSync } = require('node:child_process');
+const { version: PKG_VERSION } = require('../package.json');
+
+const { discoverInstalledStates } = require('./lib/install-lifecycle');
+const { getInstallTargetAdapter } = require('./lib/install-targets/registry');
+const { SUPPORTED_INSTALL_TARGETS } = require('./lib/install-manifests');
+const { parseTargetArgs } = require('./lib/cli-target-args');
+
+function showHelp(exitCode = 0) {
+  console.log(`
+Usage: node scripts/auto-update.js [--target <${SUPPORTED_INSTALL_TARGETS.join('|')}>] [--repo-root <path>] [--dry-run] [--json]
+
+Pull the latest EGC repo changes and reinstall the current context's managed targets
+using the original install-state request.
+`);
+  process.exit(exitCode);
+}
+
+function parseArgs(argv) {
+  return parseTargetArgs(argv, { supportsDryRun: true });
+}
+
+function deriveRepoRootFromState(state) {
+  const operations = Array.isArray(state?.operations) ? state.operations : [];
+
+  // Prefer deriving root from the currently running package (__dirname = <pkg>/scripts)
+  // This works correctly regardless of which Node version is active.
+  const pkgRoot = path.resolve(__dirname, '..');
+  for (const operation of operations) {
+    if (typeof operation.sourceRelativePath !== 'string' || !operation.sourceRelativePath.trim()) {
+      continue;
+    }
+    if (fs.existsSync(path.join(pkgRoot, operation.sourceRelativePath))) {
+      return pkgRoot;
+    }
+  }
+
+  // Fallback: derive from absolute sourcePath (git-clone installs)
+  for (const operation of operations) {
+    if (typeof operation.sourcePath !== 'string' || !operation.sourcePath.trim()) {
+      continue;
+    }
+    if (typeof operation.sourceRelativePath !== 'string' || !operation.sourceRelativePath.trim()) {
+      continue;
+    }
+    const relativeParts = operation.sourceRelativePath
+      .split(/[\\/]+/)
+      .filter(Boolean);
+    if (relativeParts.length === 0) {
+      continue;
+    }
+    return relativeParts.reduce(
+      (dir) => path.dirname(dir),
+      path.resolve(operation.sourcePath)
+    );
+  }
+
+  throw new Error('Unable to infer EGC repo root from install-state operations');
+}
+
+function buildInstallApplyArgs(record) {
+  const state = record.state;
+  const target = state.target.target || record.adapter.target;
+  const request = state.request || {};
+  const args = [];
+
+  if (target) {
+    args.push('--target', target);
+  }
+
+  if (request.profile) {
+    args.push('--profile', request.profile);
+  }
+
+  if (Array.isArray(request.modules) && request.modules.length > 0) {
+    args.push('--modules', request.modules.join(','));
+  }
+
+  for (const componentId of Array.isArray(request.includeComponents) ? request.includeComponents : []) {
+    args.push('--with', componentId);
+  }
+
+  for (const componentId of Array.isArray(request.excludeComponents) ? request.excludeComponents : []) {
+    args.push('--without', componentId);
+  }
+
+  for (const language of Array.isArray(request.legacyLanguages) ? request.legacyLanguages : []) {
+    args.push(language);
+  }
+
+  return args;
+}
+
+function determineInstallCwd(record, repoRoot) {
+  if (record.adapter.kind === 'project') {
+    return path.dirname(record.state.target.root);
+  }
+
+  return repoRoot;
+}
+
+function validateRepoRoot(repoRoot) {
+  const normalized = path.resolve(repoRoot);
+  const packageJsonPath = path.join(normalized, 'package.json');
+  const installApplyPath = path.join(normalized, 'scripts', 'install-apply.js');
+
+  if (!fs.existsSync(packageJsonPath)) {
+    throw new Error(`Invalid EGC repo root: missing package.json at ${packageJsonPath}`);
+  }
+
+  if (!fs.existsSync(installApplyPath)) {
+    throw new Error(`Invalid EGC repo root: missing install script at ${installApplyPath}`);
+  }
+
+  return normalized;
+}
+
+function runExternalCommand(command, args, options = {}) {
+  const result = spawnSync(command, args, {
+    cwd: options.cwd,
+    env: options.env || process.env,
+    encoding: 'utf8',
+    maxBuffer: 10 * 1024 * 1024,
+  });
+
+  if (result.error) {
+    throw result.error;
+  }
+
+  if (typeof result.status === 'number' && result.status !== 0) {
+    const errorOutput = (result.stderr || result.stdout || '').trim();
+    throw new Error(`${command} ${args.join(' ')} failed${errorOutput ? ': ' + errorOutput : ''}`);
+  }
+
+  return result;
+}
+
+// npm renames the package folder during a global update, and Windows refuses
+// the rename while any process holds a file inside it: an AI tool running the
+// EGC MCP servers, or a terminal with a hook mid-run, is enough to fail the
+// upgrade with EBUSY. Say so where the upgrade command is suggested (#1380).
+function npmUpgradeHint(platform = process.platform) {
+  const lines = [
+    `EGC is installed via npm (v${PKG_VERSION}).`,
+    'To upgrade to a newer version, run: npm install -g @egchq/egc@latest',
+  ];
+  if (platform === 'win32') {
+    lines.push(
+      '  On Windows, close the AI tools and terminals that run EGC before that command:',
+      '  a file held open inside the package folder makes npm fail with EBUSY.',
+    );
+  }
+  return lines;
+}
+
+function performGitUpdate(repoRoot, env, execute) {
+  const isGitRepo = fs.existsSync(path.join(repoRoot, '.git'));
+  if (!isGitRepo) {
+    // npm-installed: git pull is not applicable. Reinstall from current package.
+    for (const line of npmUpgradeHint()) console.log(line);
+    console.log('Reinstalling current version into managed targets...\n');
+  } else {
+    execute('git', ['fetch', '--all', '--prune'], { cwd: repoRoot, env });
+    try {
+      execute('git', ['pull', '--ff-only'], { cwd: repoRoot, env });
+    } catch (pullError) {
+      const msg = String(pullError.message || '');
+      if (msg.includes('no tracking information') || msg.includes('set-upstream')) {
+        throw new Error(
+          'git pull failed: no upstream tracking branch configured.\n' +
+          'To update: npm install -g @egchq/egc@latest\n' +
+          'Or set upstream: git branch --set-upstream-to=origin/<branch>',
+          { cause: pullError }
+        );
+      }
+      throw pullError;
+    }
+  }
+}
+
+function runCognitiveBootstrap(repoRoot, env, execute) {
+  const bootstrapScript = path.join(repoRoot, 'scripts', 'bootstrap-cognitive.js');
+  if (!fs.existsSync(bootstrapScript)) {
+    return null;
+  }
+
+  try {
+    const result = execute(process.execPath, [bootstrapScript], { cwd: repoRoot, env });
+    return { status: 'ok', output: (result.stdout || '').trim() };
+  } catch (error) {
+    return { status: 'error', error: error.message };
+  }
+}
+
+function applyInstalls(validRecords, options, repoRoot, env, execute) {
+  const results = [];
+  for (const entry of validRecords) {
+    const installArgs = buildInstallApplyArgs(entry.record);
+    const args = [
+      path.join(repoRoot, 'scripts', 'install-apply.js'),
+      ...installArgs,
+      '--json',
+    ];
+
+    if (options.dryRun) {
+      args.push('--dry-run');
+    }
+
+    try {
+      const commandResult = execute(process.execPath, args, {
+        cwd: determineInstallCwd(entry.record, repoRoot),
+        env,
+      });
+
+      let payload = null;
+      if (commandResult.stdout?.trim()) {
+        payload = JSON.parse(commandResult.stdout);
+      }
+
+      results.push({
+        adapter: entry.record.adapter,
+        installStatePath: entry.record.installStatePath,
+        repoRoot,
+        cwd: determineInstallCwd(entry.record, repoRoot),
+        installArgs,
+        status: options.dryRun ? 'planned' : 'updated',
+        payload,
+      });
+    } catch (error) {
+      results.push({
+        adapter: entry.record.adapter,
+        installStatePath: entry.record.installStatePath,
+        repoRoot,
+        installArgs,
+        status: 'error',
+        error: error.message,
+      });
+    }
+  }
+  return results;
+}
+
+function resolveRepoRootForRecords(records, requestedRepoRoot, results) {
+  const validRecords = [];
+  const inferredRepoRoots = [];
+  for (const record of records) {
+    if (record.error || !record.state) {
+      results.push({
+        adapter: record.adapter,
+        installStatePath: record.installStatePath,
+        status: 'error',
+        error: record.error || 'No valid install-state available',
+      });
+      continue;
+    }
+
+    const recordRepoRoot = requestedRepoRoot || validateRepoRoot(deriveRepoRootFromState(record.state));
+    inferredRepoRoots.push(recordRepoRoot);
+    validRecords.push({
+      record,
+      repoRoot: recordRepoRoot,
+    });
+  }
+
+  if (!requestedRepoRoot) {
+    const uniqueRepoRoots = [...new Set(inferredRepoRoots)];
+    if (uniqueRepoRoots.length > 1) {
+      throw new Error(`Multiple EGC repo roots detected: ${uniqueRepoRoots.join(', ')}`);
+    }
+  }
+
+  return {
+    validRecords,
+    repoRoot: requestedRepoRoot || inferredRepoRoots[0] || null,
+  };
+}
+
+function runAutoUpdate(options = {}, dependencies = {}) {
+  const discover = dependencies.discoverInstalledStates || discoverInstalledStates;
+  const execute = dependencies.runExternalCommand || runExternalCommand;
+  const homeDir = options.homeDir || process.env.HOME || process.env.USERPROFILE || os.homedir();
+  const projectRoot = options.projectRoot || process.cwd();
+  const requestedRepoRoot = options.repoRoot ? validateRepoRoot(options.repoRoot) : null;
+
+  // A retired or unknown target id (an old script, shell history, or an
+  // install predating a retirement) must not crash the whole update: it is
+  // reported as skipped and every still-registered target proceeds.
+  const results = [];
+  const requestedTargets = Array.isArray(options.targets) ? options.targets : [];
+  const resolvableTargets = [];
+  for (const target of requestedTargets) {
+    try {
+      getInstallTargetAdapter(target);
+      resolvableTargets.push(target);
+    } catch (_error) { // NOSONAR: unknown adapter is the signal, not a failure
+      results.push({
+        adapter: { id: String(target), target: String(target), kind: 'unknown' },
+        installStatePath: '(not managed)',
+        status: 'skipped',
+        error: `target "${target}" is retired or unknown; the install package no longer manages it`,
+      });
+    }
+  }
+
+  const records = (requestedTargets.length > 0 && resolvableTargets.length === 0)
+    ? []
+    : discover({
+      homeDir,
+      projectRoot,
+      targets: resolvableTargets.length > 0 ? resolvableTargets : options.targets,
+    }).filter(record => record.exists);
+
+  if (records.length === 0) {
+    return {
+      dryRun: Boolean(options.dryRun),
+      repoRoot: requestedRepoRoot,
+      results,
+      summary: {
+        checkedCount: results.length,
+        updatedCount: 0,
+        errorCount: 0,
+      },
+    };
+  }
+
+  const { validRecords, repoRoot } = resolveRepoRootForRecords(records, requestedRepoRoot, results);
+  if (!repoRoot) {
+    return {
+      dryRun: Boolean(options.dryRun),
+      repoRoot,
+      results,
+      summary: {
+        checkedCount: results.length,
+        updatedCount: 0,
+        errorCount: results.length,
+      },
+    };
+  }
+
+  const env = {
+    ...process.env,
+    HOME: homeDir,
+    USERPROFILE: homeDir,
+  };
+
+  if (!options.dryRun) {
+    performGitUpdate(repoRoot, env, execute);
+  }
+
+  const cognitiveBootstrap = options.dryRun ? null : runCognitiveBootstrap(repoRoot, env, execute);
+
+  results.push(...applyInstalls(validRecords, options, repoRoot, env, execute));
+
+  return {
+    dryRun: Boolean(options.dryRun),
+    repoRoot,
+    cognitiveBootstrap,
+    results,
+    summary: {
+      checkedCount: results.length,
+      updatedCount: results.filter(result => result.status === 'updated' || result.status === 'planned').length,
+      errorCount: results.filter(result => result.status === 'error').length,
+    },
+  };
+}
+
+function printHuman(result) {
+  if (result.results.length === 0) {
+    console.log('No EGC install-state files found for the current home/project context.');
+    return;
+  }
+
+  console.log(`${result.dryRun ? 'Auto-update dry run' : 'Auto-update summary'}:\n`);
+  if (result.repoRoot) {
+    console.log(`Repo root: ${result.repoRoot}\n`);
+  }
+
+  if (result.cognitiveBootstrap) {
+    console.log(`Cognitive protocol bootstrap: ${result.cognitiveBootstrap.status.toUpperCase()}`);
+    if (result.cognitiveBootstrap.output) {
+      console.log(result.cognitiveBootstrap.output);
+    }
+    if (result.cognitiveBootstrap.error) {
+      console.log(`  Error: ${result.cognitiveBootstrap.error}`);
+    }
+    console.log('');
+  }
+
+  for (const entry of result.results) {
+    console.log(`- ${entry.adapter.id}`);
+    console.log(`  Status: ${entry.status.toUpperCase()}`);
+    console.log(`  Install-state: ${entry.installStatePath}`);
+    if (entry.error) {
+      console.log(`  Error: ${entry.error}`);
+      continue;
+    }
+
+    console.log(`  Reinstall args: ${entry.installArgs.join(' ') || '(none)'}`);
+  }
+
+  console.log(`\nSummary: checked=${result.summary.checkedCount}, ${result.dryRun ? 'planned' : 'updated'}=${result.summary.updatedCount}, errors=${result.summary.errorCount}`);
+}
+
+function main() {
+  try {
+    const options = parseArgs(process.argv);
+    if (options.help) {
+      showHelp(0);
+    }
+
+    const result = runAutoUpdate({
+      homeDir: process.env.HOME || process.env.USERPROFILE || os.homedir(),
+      projectRoot: process.cwd(),
+      targets: options.targets,
+      repoRoot: options.repoRoot,
+      dryRun: options.dryRun,
+    });
+
+    if (options.json) {
+      console.log(JSON.stringify(result, null, 2));
+    } else {
+      printHuman(result);
+    }
+
+    process.exitCode = result.summary.errorCount > 0 ? 1 : 0;
+  } catch (error) {
+    console.error(`Error: ${error.message}`);
+    process.exit(1);
+  }
+}
+
+if (require.main === module) {
+  main();
+}
+
+module.exports = {
+  parseArgs,
+  deriveRepoRootFromState,
+  buildInstallApplyArgs,
+  determineInstallCwd,
+  npmUpgradeHint,
+  runCognitiveBootstrap,
+  runAutoUpdate,
+};

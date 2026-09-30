@@ -1,0 +1,462 @@
+$ErrorActionPreference = "Stop"
+
+# The directory the person ran the installer FROM. Captured here, before any
+# Set-Location moves to the package root, because the project .mcp.json merge
+# near the end must target their project, not the package.
+$InvokedFromDir = (Get-Location).Path
+
+$RootDir       = Split-Path -Parent $PSScriptRoot
+$BootstrapDb   = Join-Path (Join-Path $RootDir "scripts") "bootstrap-state-db.js"
+$EgcInstall    = Join-Path (Join-Path $RootDir "scripts") "install-apply.js"
+$GuardianBin   = Join-Path (Join-Path (Join-Path (Join-Path (Join-Path $RootDir "mcp") "servers") "egc-guardian") "build") "index.js"
+$MemoryBin     = Join-Path (Join-Path (Join-Path (Join-Path (Join-Path $RootDir "mcp") "servers") "egc-memory") "build") "index.js"
+
+# npm strips the root package-lock.json from published tarballs, so a globally
+# installed package has no root lockfile (npm already resolved its deps during
+# `npm install -g`). The sub-package lockfiles travel via package.json "files",
+# so run a pinned `npm ci` wherever a lockfile is present and skip entirely
+# otherwise -- mirrors install.sh's install_deps exactly, including the lack
+# of an npm install fallback (a global install has already resolved deps).
+function Test-DirectoryWritable {
+    param([string]$Directory)
+    $probe = Join-Path $Directory ([System.IO.Path]::GetRandomFileName())
+    try {
+        [System.IO.File]::WriteAllText($probe, "")
+        Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Install-Deps {
+    if (-not (Test-Path "package-lock.json")) {
+        return
+    }
+    $here = (Get-Location).Path
+    if (Test-DirectoryWritable $here) {
+        npm ci --silent
+        if ($LASTEXITCODE -ne 0) {
+            $rc = $LASTEXITCODE
+            [Console]::Error.WriteLine("Error: npm ci failed in $here (exit $rc). Re-run with network access, or fix the directory ownership and try again.")
+            exit $rc
+        }
+        return
+    }
+    # A read-only directory is a global npm prefix owned by another account
+    # (an elevated `npm install -g`, then `egc install` from a normal
+    # terminal). npm ci cannot write node_modules here, and with --silent its
+    # failure used to end the install without a message. The published
+    # package root already carries every dependency the MCP servers declare,
+    # one level up, so confirm that and carry on. Mirrors install.sh.
+    node (Join-Path (Join-Path $RootDir "scripts") "check-mcp-deps.js") $here
+    if ($LASTEXITCODE -eq 0) {
+        Write-Output "  dependencies provided by the package root ($here is read-only)"
+        return
+    }
+    [Console]::Error.WriteLine("Error: $here is not writable and its dependencies are not available from the package root. Re-run 'npm install -g @egchq/egc' as the user that owns the npm prefix, or fix the prefix ownership (see docs/installation.md, Permissions).")
+    exit 1
+}
+
+# The link target of a directory entry, or $null when the entry does not
+# exist or is not a link.
+function Get-DirectoryLinkTarget {
+    param([string]$Candidate)
+    try {
+        $item = Get-Item -LiteralPath $Candidate -Force -ErrorAction Stop
+    } catch {
+        return $null
+    }
+    if ($item -and $item.PSObject.Properties['Target'] -and $item.Target) {
+        return @($item.Target)[0]
+    }
+    return $null
+}
+
+# The non-empty path components of a relative tail, in order.
+function Split-PathSegments {
+    param([string]$Tail)
+    $segments = @()
+    foreach ($piece in ($Tail.Trim('\', '/') -split '[\\/]+')) {
+        if ($piece) { $segments += $piece }
+    }
+    return ,$segments
+}
+
+# Where a link target starts resolving from: a rooted target restarts from
+# its own root; a relative target is relative to the link's own directory,
+# which is exactly where the current resolution already points.
+function Split-LinkTarget {
+    param([string]$Target, [string]$Base)
+    if ([System.IO.Path]::IsPathRooted($Target)) {
+        $root = [System.IO.Path]::GetPathRoot($Target)
+        return @{ Root = $root; Tail = $Target.Substring($root.Length) }
+    }
+    return @{ Root = $Base; Tail = $Target }
+}
+# Two paths can name the same directory in several ways: different separators
+# (C:/repo vs C:\repo, routine when the installer is launched from Git Bash),
+# a trailing slash, or a symlink/junction anywhere along the path, including a
+# parent component. Comparing anything less than the fully resolved physical
+# path risks treating the package's own directory as somebody's project and
+# rewriting its bundled .mcp.json. .NET's ResolveLinkTarget is unavailable in
+# Windows PowerShell 5.1, so each component is resolved in turn (with a small
+# depth cap for chained links), which works on every supported version.
+function Resolve-PhysicalDirectory {
+    param([string]$Path)
+
+    # Returns $null when the path cannot be fully resolved. Callers must
+    # treat that as "unknown", never as "different": a partial answer here
+    # is what would let the installer mistake its own directory for a user
+    # project and rewrite the bundled .mcp.json.
+    try {
+        $full = [System.IO.Path]::GetFullPath($Path)
+    } catch {
+        return $null
+    }
+
+    # Components are consumed from a queue rather than a fixed list: when one
+    # of them turns out to be a link, the target's own components are pushed
+    # back onto the front of the queue, so links nested inside a link target
+    # get resolved on the same pass. The step budget only bounds pathological
+    # cycles; it is never reached by a real directory tree.
+    $pending = New-Object 'System.Collections.Generic.Queue[string]'
+    $resolved = [System.IO.Path]::GetPathRoot($full)
+    foreach ($segment in (Split-PathSegments ($full.Substring($resolved.Length)))) { $pending.Enqueue($segment) }
+
+    $steps = 0
+    while ($pending.Count -gt 0) {
+        $steps++
+        # Only a cyclic link chain gets here; a real tree never does. The
+        # path stays unresolved rather than half-resolved.
+        if ($steps -gt 512) { return $null }
+
+        $segment = $pending.Dequeue()
+        if ($segment -eq '.') { continue }
+        if ($segment -eq '..') {
+            $resolved = [System.IO.Path]::GetFullPath((Join-Path $resolved '..'))
+            continue
+        }
+
+        $candidate = Join-Path $resolved $segment
+        $target = Get-DirectoryLinkTarget $candidate
+        if (-not $target) {
+            $resolved = $candidate
+            continue
+        }
+
+        $remaining = @($pending.ToArray())
+        $pending.Clear()
+        $parts = Split-LinkTarget $target $resolved
+        $resolved = $parts.Root
+        foreach ($piece in (Split-PathSegments $parts.Tail)) { $pending.Enqueue($piece) }
+        foreach ($piece in $remaining) { $pending.Enqueue($piece) }
+    }
+
+    return [System.IO.Path]::GetFullPath($resolved).TrimEnd('\', '/')
+}
+
+# Forward --help directly to the Node installer
+if ($args -contains '--help') {
+    node $EgcInstall @args
+    exit $LASTEXITCODE
+}
+
+Write-Host "EGC install"
+
+# Node.js version check. Keep this floor in lockstep with package.json
+# "engines" and scripts/preinstall.js, which both require Node 20; a lower
+# gate here would let 18/19 reach the better-sqlite3 build and the
+# TypeScript build steps below.
+try {
+    # The last line node prints is its version, even when a wrapper prints
+    # something before it.
+    $nodeVersionText = "$(node --version | Select-Object -Last 1)".Trim()
+    $nodeVersion = $nodeVersionText.TrimStart('v').Split('.')[0]
+    if ([int]$nodeVersion -lt 20) {
+        Write-Error "Node.js >= 20 is required (found: $nodeVersionText)"
+        exit 1
+    }
+    Write-Host "  node $nodeVersionText"
+} catch {
+    Write-Error "Node.js not found. Install from https://nodejs.org"
+    exit 1
+}
+
+$DryRun = $args -contains '--dry-run'
+
+# The prompt library (agents, skills, commands, rules) is opt-in: the bare
+# install sets up the engine and asks about the library only at an
+# interactive console, default no. --prompt-library adds it without asking;
+# --no-prompt-library skips the question (CI, provisioning).
+$PromptLibrary = $null
+if (($args -contains '--prompt-library') -and ($args -contains '--no-prompt-library')) {
+    Write-Host "Error: --prompt-library and --no-prompt-library cannot be combined" -ForegroundColor Red
+    exit 1
+}
+if ($args -contains '--prompt-library') { $PromptLibrary = $true }
+if ($args -contains '--no-prompt-library') { $PromptLibrary = $false }
+
+# Optional dependency hints (non-blocking)
+if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
+    Write-Host "  Optional dependency not found: uv"
+    Write-Host "    Required only for Jira and omega-memory MCP servers."
+    Write-Host "    Core EGC installation is unaffected. Install: https://docs.astral.sh/uv/"
+}
+
+if (-not $DryRun) {
+    # Root dependencies
+    Write-Host "  installing root dependencies..."
+    Set-Location -Path $RootDir
+    Install-Deps
+
+    # Point the "egc" command at this checkout, so the "egc doctor" the
+    # message at the end of this script tells the user to run (and anything
+    # else they type afterward) targets the code that was just installed
+    # rather than a stale prior global install left on PATH from an earlier
+    # npm publish. Skipped when this tree IS the global npm install
+    # (`egc install` right after `npm install -g @egchq/egc`): the egc
+    # command on PATH already points here, so there is nothing stale to
+    # outrank, and without permission to the global prefix the link can only
+    # fail and print a note about a checkout the person does not have
+    # (#1218 Linux report). Best-effort: some environments lack permission
+    # to the global npm prefix, and that must not abort the rest of the
+    # install.
+    $GlobalNpmRoot = (& npm root -g 2>$null)
+    $IsGlobalNpmInstall = $false
+    if ($GlobalNpmRoot) {
+        $GlobalPkgDir = Join-Path (Join-Path $GlobalNpmRoot "@egchq") "egc"
+        if (Test-Path $GlobalPkgDir) {
+            $IsGlobalNpmInstall = ((Resolve-Path $GlobalPkgDir).Path -eq (Resolve-Path $RootDir).Path)
+        }
+    }
+    if ($IsGlobalNpmInstall) {
+        Write-Host "  egc command already provided by the global npm install"
+    } else {
+        Write-Host "  linking the egc command to this checkout..."
+        # PowerShell does not treat a non-zero exit code from a native command as
+        # a terminating error, so a try/catch here would never fire: check
+        # $LASTEXITCODE explicitly instead, matching the "||" pattern install.sh
+        # uses for the same fallback (cubic review, PR #1096).
+        npm link --silent 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "  note: npm link failed (no permission to the global npm prefix?). Run 'npm link' manually, or use 'node scripts\egc.js <command>' from this checkout." -ForegroundColor Yellow
+        }
+    }
+
+    # The native sqlite3 binary is a prebuilt download; when it cannot load
+    # here, EGC runs on its portable engine (full-text search degrades to
+    # substring matching), so this is a note rather than a warning.
+    node (Join-Path (Join-Path $RootDir "scripts") "check-native-sqlite.js") 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  note: native sqlite3 unavailable on this machine; EGC uses its portable engine (search falls back to substring matching)."
+    }
+
+    # egc-guardian
+    Write-Host "  building egc-guardian..."
+    $GuardianDir = Join-Path (Join-Path (Join-Path $RootDir "mcp") "servers") "egc-guardian"
+    if (-not (Test-Path $GuardianDir)) {
+        Write-Error "Not found: $GuardianDir"
+        exit 1
+    }
+    Set-Location -Path $GuardianDir
+    Install-Deps
+    # The published package ships build/ but not src/, so only (re)build from
+    # a git checkout where the TypeScript sources are present.
+    if (Test-Path "src") {
+        npm run build
+    }
+
+    # egc-memory
+    Write-Host "  building egc-memory..."
+    $MemoryDir = Join-Path (Join-Path (Join-Path $RootDir "mcp") "servers") "egc-memory"
+    if (-not (Test-Path $MemoryDir)) {
+        Write-Error "Not found: $MemoryDir"
+        exit 1
+    }
+    Set-Location -Path $MemoryDir
+    Install-Deps
+    # Published package ships build/ but not src/; only build from a checkout.
+    if (Test-Path "src") {
+        npm run build
+    }
+
+    # Initialize database
+    Write-Host "  initializing database..."
+    Set-Location -Path $RootDir
+    node $BootstrapDb
+    Write-Host "  bootstrapping cognitive protocol..."
+    node (Join-Path $RootDir (Join-Path "scripts" "bootstrap-cognitive.js"))
+
+    # README promises memory "never gets committed to git" unconditionally,
+    # but only `egc init` configured the filter that keeps that promise --
+    # this quick-start script (the README's own documented command) never
+    # did (2026-08-01 audit finding). Best-effort: must not fail the install.
+    node "$RootDir/scripts/lib/apply-commit-privacy.js"
+    if ($LASTEXITCODE -ne 0) { Write-Host "  note: commit-privacy filter setup failed (non-fatal)" }
+
+    # Write harness config
+    Set-Location -Path $RootDir
+    $mcpConfig = @{
+        mcpServers = @{
+            "egc-guardian" = @{ command = "node"; args = @($GuardianBin) }
+            "egc-memory"   = @{ command = "node"; args = @($MemoryBin)   }
+        }
+    } | ConvertTo-Json -Depth 4
+    if (Test-DirectoryWritable $RootDir) {
+        $mcpConfig | Set-Content -Path (Join-Path $RootDir ".mcp.egc.json") -Encoding UTF8
+        Write-Host "  harness config written to .mcp.egc.json"
+    } else {
+        Write-Host "  note: $RootDir is read-only; skipping the .mcp.egc.json convenience copy"
+    }
+}
+
+# Delegate to Node installer only when install-relevant args are present
+Set-Location -Path $RootDir
+$hasInstallArgs = $false
+foreach ($arg in $args) {
+    if ($arg -match '^(--target|--profile|--modules|--config|--with|--without|--dry-run|--json)$') {
+        $hasInstallArgs = $true; break
+    }
+    if (-not $arg.StartsWith('-')) {
+        $hasInstallArgs = $true; break
+    }
+}
+if ($hasInstallArgs) {
+    node $EgcInstall @args
+    $installExitCode = $LASTEXITCODE
+    # A refused or failed targeted install ends the run here, the way the
+    # bash installer stops under set -e, instead of carrying on to the
+    # prompt-library step and the registration as if it had succeeded.
+    if ($DryRun -or $installExitCode -ne 0) {
+        exit $installExitCode
+    }
+}
+
+# Prompt library: opt-in. The question is asked only at an interactive
+# console and defaults to no; --prompt-library answers yes without asking
+# and --no-prompt-library skips the question. A headless run (CI, redirected
+# stdin) skips it with a note: a piped stdin used to reach Read-Host, come
+# back $null instantly and make the whole block vanish without a word
+# (Windows report in #1217), so the gate tests IsInputRedirected and the
+# skip is announced.
+$isInteractive = [Environment]::UserInteractive -and -not $env:CI -and -not [Console]::IsInputRedirected
+$installLibrary = $false
+$libraryFailed = $false
+if (-not $DryRun) {
+    if ($PromptLibrary -eq $true) {
+        $installLibrary = $true
+    } elseif ($PromptLibrary -eq $false) {
+        Write-Host "  prompt library skipped (--no-prompt-library). Run 'egc install --prompt-library' to add it later."
+    } elseif ($isInteractive) {
+        $ans = Read-Host "`n  Install prompt library? (61 agents, 232 skills, 77 commands) [y/N]"
+        # A null or empty answer is the default: no. Only an explicit y installs.
+        $installLibrary = ($ans -eq 'Y' -or $ans -eq 'y')
+    } else {
+        Write-Host "  note: non-interactive session; skipping the prompt-library step. Run 'egc install --prompt-library' to add it."
+    }
+}
+if ($installLibrary) {
+    # One detection list for every tool, shared with the shell installer:
+    # scripts/lib/install/prompt-library.js applies the full profile to each
+    # detected home target and runs the remaining per-tool shell scripts.
+    node (Join-Path $RootDir (Join-Path "scripts" "install-prompt-library.js"))
+    # A tool that did not get the library is reported at the end and turns
+    # the exit status non-zero, after the engine steps below have all run.
+    if ($LASTEXITCODE -ne 0) { $libraryFailed = $true }
+}
+if (-not $DryRun) {
+    # MCP auto-registration
+    Write-Host "  registering MCP servers..."
+
+    function Register-McpJson {
+        param([string]$Target, [string]$Label)
+        $dir = Split-Path $Target -Parent
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $obj = @{ mcpServers = @{} }
+        if (Test-Path $Target) {
+            try {
+                $obj = Get-Content $Target -Raw | ConvertFrom-Json -AsHashtable
+            } catch {
+                # Existing config is not valid JSON: leave it untouched and
+                # skip, matching install.sh's Node helper exactly. Falling
+                # through here would merge the new servers into a fresh empty
+                # hashtable and overwrite the file, destroying whatever the
+                # user already had in it.
+                Write-Host "  - skipped $Label ($Target): existing config is not valid JSON" -ForegroundColor Yellow
+                return
+            }
+        }
+        if (-not $obj.mcpServers) { $obj.mcpServers = @{} }
+        $changed = $false
+        if (-not $obj.mcpServers.ContainsKey("egc-guardian")) {
+            $obj.mcpServers["egc-guardian"] = @{ command = "node"; args = @($GuardianBin) }
+            $changed = $true
+        }
+        if (-not $obj.mcpServers.ContainsKey("egc-memory")) {
+            $obj.mcpServers["egc-memory"] = @{ command = "node"; args = @($MemoryBin) }
+            $changed = $true
+        }
+        if ($changed) {
+            $obj | ConvertTo-Json -Depth 6 | Set-Content -Path $Target -Encoding UTF8
+            Write-Host "  v registered in $Label ($Target)"
+        }
+    }
+
+    # One registration list for every entry point. This block used to be a
+    # hand-written copy of scripts/lib/mcp-register.js and had drifted:
+    # Continue.dev and Zed were never registered here, so installing through
+    # PowerShell wired up fewer tools than `egc init` did on the same machine.
+
+    # Run from the directory the person invoked the installer in, so a
+    # project .mcp.json there is picked up; the script itself moved to the
+    # package root long ago.
+    # -LiteralPath: a real directory whose name contains [ ] * or ? is a
+    # wildcard pattern to Push-Location otherwise, and the resulting error
+    # would abort the installer before registration and everything after it.
+    Push-Location -LiteralPath $InvokedFromDir
+    try {
+        & node (Join-Path $RootDir "scripts/lib/mcp-register-cli.js") $GuardianBin $MemoryBin
+    } finally {
+        Pop-Location
+    }
+
+    # Install git pre-commit hook in a clone (strips egc:state blocks before
+    # commits), through the helper install.sh runs as well.
+    # A native command's failure is no terminating error in PowerShell, so the
+    # exit code is read here, the way install.sh stops on it under set -e.
+    node (Join-Path $RootDir (Join-Path "scripts" (Join-Path "lib" "git-pre-commit-install.js")))
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  git pre-commit hook could not be installed (exit code $LASTEXITCODE); the install stops here." -ForegroundColor Red
+        exit $LASTEXITCODE
+    }
+
+    # Token Crusher PATH-level binary shim (git, npm, gh, ...). Best-effort:
+    # a failure here (permission, unsupported shell profile, ...) must never
+    # abort an otherwise successful install.
+    Write-Host ""
+    Write-Host "  installing Token Crusher binary shim..."
+    $CrusherShim = Join-Path (Join-Path $RootDir "scripts") "crusher-shim.js"
+    try {
+        node $CrusherShim install
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "  note: crusher-shim install failed (non-fatal). Run 'node scripts\crusher-shim.js install' manually to retry." -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host "  note: crusher-shim install failed (non-fatal). Run 'node scripts\crusher-shim.js install' manually to retry." -ForegroundColor Yellow
+    }
+
+    Write-Host ""
+    Write-Host "Installation complete."
+    if (-not $hasInstallArgs) {
+        # Same single decision point as install.sh: shouldAutoLaunch()
+        # inside the wrapper decides whether to launch, and prints the
+        # headless message itself when it declines.
+        & node (Join-Path $RootDir "scripts/lib/dashboard-launch-cli.js") $RootDir
+    }
+    Write-Host "Re-check anytime with 'egc doctor'."
+    if ($libraryFailed) {
+        Write-Host "  prompt library: one or more detected tools did not get it (see the notes above)." -ForegroundColor Yellow
+        exit 1
+    }
+}

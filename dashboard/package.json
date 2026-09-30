@@ -8,6 +8,9 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "ajv": "^8.20.0",
+    "js-yaml": "^5.4.2",
+    "sql.js": "^1.14.2",
     "ws": "^8.16.0"
   }
 }

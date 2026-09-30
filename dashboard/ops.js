@@ -20,13 +20,13 @@ const fs     = require('node:fs');
 const os     = require('node:os');
 const path   = require('node:path');
 
-const operations = require('../scripts/lib/operations/index');
-const { normalizeInstallRequest } = require('../scripts/lib/install/request');
-const { listInstallTargetAdapters } = require('../scripts/lib/install-targets/registry');
-const { findDefaultInstallConfigPath, loadInstallConfig } = require('../scripts/lib/install/config');
-const { listInstallProfiles } = require('../scripts/lib/install-manifests');
-const { applyCommitPrivacyFilterCli } = require('../scripts/lib/memory-filters');
-const { listInstalledPlugins, reinstallAllPlugins } = require('../scripts/lib/plugin-registry');
+const operations = require('./scripts/lib/operations/index');
+const { normalizeInstallRequest } = require('./scripts/lib/install/request');
+const { listInstallTargetAdapters } = require('./scripts/lib/install-targets/registry');
+const { findDefaultInstallConfigPath, loadInstallConfig } = require('./scripts/lib/install/config');
+const { listInstallProfiles } = require('./scripts/lib/install-manifests');
+const { applyCommitPrivacyFilterCli } = require('./scripts/lib/memory-filters');
+const { listInstalledPlugins, reinstallAllPlugins } = require('./scripts/lib/plugin-registry');
 
 const TOKEN_FILE_NAME = 'dashboard-token';
 const TOKEN_BYTES     = 32;

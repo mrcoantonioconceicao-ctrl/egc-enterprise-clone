@@ -2,7 +2,7 @@
 
 const http = require('http');
 
-const { readDashboardToken } = require('../scripts/lib/dashboard-token');
+const { readDashboardToken } = require('./scripts/lib/dashboard-token');
 
 const TOKEN_HEADER = 'x-egc-token';
 

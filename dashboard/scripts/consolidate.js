@@ -1,0 +1,261 @@
+#!/usr/bin/env node
+
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const {
+  DEFAULT_THRESHOLD,
+  WORKING_WINDOW_DAYS,
+  EPISODIC_WINDOW_DAYS,
+  consolidateState,
+  backupStateFile,
+} = require('./lib/state-consolidate');
+const { isEncryptedBuffer, decryptStateBuffer, encryptStateBuffer } = require('./lib/state-crypto');
+const { withStateFileLockSync } = require('./lib/state-snapshot');
+const { getStateDir, detectBranch, resolveStateRead, resolveStateWrite } = require('./lib/branch-state');
+const { loadOrCreateIntegrityKey, writeHmac } = require('./lib/state-integrity');
+
+function showHelp(exitCode = 0) {
+  console.log(`
+Usage: node scripts/consolidate.js [--dry-run] [--force] [--json] [--project <path>] [--threshold <lines>]
+
+Compact the project state file (~/.egc/state/<slug>.md) when it grows past a
+line threshold (default: ${DEFAULT_THRESHOLD}, override with --threshold or the
+EGC_CONSOLIDATE_THRESHOLD environment variable).
+
+Rule-based layering by entry age:
+  Working layer   last ${WORKING_WINDOW_DAYS} days, kept verbatim
+  Episodic layer  last ${EPISODIC_WINDOW_DAYS} days, summarized per week
+  Semantic layer  older entries, condensed to core facts
+
+Entry dates are extracted from the entry text (YYYY-MM-DD or DD/MM/YYYY).
+Entries without a recognizable date are treated as semantic layer. The
+Context and Next Session sections are never layered, only deduplicated.
+
+The original file is always copied to ~/.egc/state/archive/ before rewrite.
+
+Options:
+  --dry-run            Preview the consolidated output without writing
+  --force              Consolidate even when below the threshold
+  --json               Emit a machine-readable report
+  --project <path>     Project root (defaults to the current directory)
+  --threshold <lines>  Line count that triggers consolidation
+`);
+  process.exit(exitCode);
+}
+
+function parseArgs(argv) {
+  const args = argv.slice(2);
+  const parsed = {
+    dryRun: false,
+    force: false,
+    json: false,
+    project: null,
+    threshold: null,
+    help: false,
+  };
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+
+    if (arg === '--dry-run') {
+      parsed.dryRun = true;
+    } else if (arg === '--force') {
+      parsed.force = true;
+    } else if (arg === '--json') {
+      parsed.json = true;
+    } else if (arg === '--project') {
+      const value = args[index + 1];
+      if (!value || value.startsWith('--')) {
+        throw new Error('Missing value for --project');
+      }
+      parsed.project = value;
+      index += 1;
+    } else if (arg === '--threshold') {
+      parsed.threshold = Number.parseInt(args[index + 1], 10);
+      if (!Number.isInteger(parsed.threshold) || parsed.threshold < 1) {
+        throw new Error(`Invalid threshold: ${args[index + 1]}`);
+      }
+      index += 1;
+    } else if (arg === '--help' || arg === '-h') {
+      parsed.help = true;
+    } else {
+      throw new Error(`Unknown argument: ${arg}`);
+    }
+  }
+
+  return parsed;
+}
+
+function resolveThreshold(options) {
+  if (options.threshold) return options.threshold;
+
+  const fromEnv = Number.parseInt(process.env.EGC_CONSOLIDATE_THRESHOLD || '', 10);
+  if (Number.isInteger(fromEnv) && fromEnv >= 1) return fromEnv;
+
+  return DEFAULT_THRESHOLD;
+}
+
+function printHuman(report) {
+  console.log('State consolidation report:\n');
+  console.log(`- Project: ${report.project}`);
+  console.log(`- State file: ${report.stateFile}`);
+
+  if (report.status === 'missing') {
+    console.log('- Status: MISSING (no state file for this project yet)');
+    return;
+  }
+
+  if (report.status === 'skipped') {
+    console.log(`- Status: SKIPPED (${report.linesBefore} lines, threshold ${report.threshold})`);
+    console.log('- Nothing to consolidate. Use --force to run anyway.');
+    return;
+  }
+
+  console.log(`- Status: ${report.dryRun ? 'DRY-RUN' : 'CONSOLIDATED'}`);
+  console.log(`- Lines: ${report.linesBefore} before, ${report.linesAfter} after (threshold ${report.threshold})`);
+  console.log(`- Working entries kept verbatim: ${report.stats.workingKept}`);
+  console.log(`- Episodic weeks summarized: ${report.stats.episodicWeeks}`);
+  console.log(`- Semantic facts condensed: ${report.stats.semanticFacts}`);
+  console.log(`- Duplicates removed: ${report.stats.duplicatesRemoved}`);
+
+  if (report.backup) {
+    console.log(`- Backup: ${report.backup}`);
+  }
+
+  if (report.dryRun) {
+    console.log('\nPreview of consolidated state:\n');
+    console.log(report.output);
+  }
+}
+
+function main() {
+  try {
+    const options = parseArgs(process.argv);
+    if (options.help) {
+      showHelp(0);
+    }
+
+    const homeDir = process.env.HOME || process.env.USERPROFILE || os.homedir();
+    const project = path.resolve(options.project || process.cwd());
+    const stateDir = getStateDir(homeDir);
+    const branch = detectBranch(project);
+    const readPath = resolveStateRead(stateDir, project, branch).filePath;
+    // Same resolveStateWrite() call the MCP server's update_state and the
+    // hook-side writers in state-snapshot.js use, so this locks and rewrites
+    // the exact file a concurrent update_state would -- not the flat legacy
+    // path, which for a git project it never touches.
+    const stateFile = resolveStateWrite(stateDir, project, branch);
+    const threshold = resolveThreshold(options);
+
+    const report = {
+      project,
+      stateFile,
+      threshold,
+      dryRun: options.dryRun,
+      status: 'skipped',
+      backup: null,
+    };
+
+    // Locked so the read-decide-write cycle can never race the MCP server's
+    // own update_state read-merge-write on the same file (a concurrent write
+    // could otherwise be silently overwritten by this consolidation).
+    withStateFileLockSync(stateFile, () => runConsolidation(report, options, readPath, stateFile, homeDir, threshold));
+  } catch (error) {
+    console.error(`Error: ${error.message}`);
+    process.exit(1);
+  }
+}
+
+function runConsolidation(report, options, readPath, stateFile, homeDir, threshold) {
+  let raw;
+  try {
+    raw = fs.readFileSync(readPath);
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      handleMissingState(report, options);
+      return;
+    }
+    throw err;
+  }
+
+  const encrypted = isEncryptedBuffer(raw);
+  const content = encrypted ? decryptStateBuffer(raw) : raw.toString('utf8');
+  if (content === null) {
+    // Thrown (not process.exit here): this runs inside withStateFileLockSync's
+    // callback, so exiting directly would skip its `finally` and leave a
+    // stale lock file. Throwing lets the lock release, then propagates to
+    // main()'s catch, which logs and exits 1 the same way.
+    throw new Error(`cannot decrypt ${readPath} -- leaving it untouched.`);
+  }
+  const result = consolidateState(content, { threshold });
+
+  report.linesBefore = result.linesBefore;
+  report.linesAfter = result.linesAfter;
+  report.stats = result.stats;
+
+  if (!result.needed && !options.force) {
+    handleNotNeeded(report, options);
+    return;
+  }
+
+  performConsolidation(report, result, readPath, stateFile, homeDir, options, encrypted);
+}
+
+function handleMissingState(report, options) {
+  report.status = 'missing';
+  if (options.json) {
+    console.log(JSON.stringify(report, null, 2));
+  } else {
+    printHuman(report);
+  }
+}
+
+function handleNotNeeded(report, options) {
+  if (options.json) {
+    console.log(JSON.stringify(report, null, 2));
+  } else {
+    printHuman(report);
+  }
+}
+
+function performConsolidation(report, result, readPath, stateFile, homeDir, options, encrypted) {
+  report.status = options.dryRun ? 'dry-run' : 'consolidated';
+
+  if (options.dryRun) {
+    report.output = result.output;
+  } else {
+    // Back up the file we actually read from -- for a first-time migration
+    // (git project with only a flat legacy file so far) that's not the same
+    // path as stateFile, which may not exist yet.
+    // The integrity key is loaded before anything is written: a key that
+    // cannot be persisted or kept private stops the rewrite instead of
+    // leaving a state file behind with a sidecar nobody can verify.
+    const integrityKey = loadOrCreateIntegrityKey();
+    report.backup = backupStateFile(homeDir, readPath);
+
+    const payload = encrypted ? encryptStateBuffer(result.output) : result.output;
+    const tmpPath = `${stateFile}.tmp-${process.pid}-${crypto.randomUUID()}`;
+    try {
+      fs.writeFileSync(tmpPath, payload, encrypted ? undefined : 'utf8');
+      try { fs.chmodSync(tmpPath, 0o600); } catch { /* not supported on Windows */ }
+      fs.renameSync(tmpPath, stateFile);
+    } finally {
+      try { fs.unlinkSync(tmpPath); } catch { /* already renamed away */ }
+    }
+    // The sidecar HMAC covers the plaintext (matching writeHmac()'s use in
+    // index.ts), computed over result.output regardless of `encrypted` --
+    // leaving it stale here is exactly the mismatch this rewrite fixes.
+    writeHmac(stateFile, result.output, integrityKey);
+
+  }
+
+  if (options.json) {
+    console.log(JSON.stringify(report, null, 2));
+  } else {
+    printHuman({ ...report, output: result.output });
+  }
+}
+
+main();

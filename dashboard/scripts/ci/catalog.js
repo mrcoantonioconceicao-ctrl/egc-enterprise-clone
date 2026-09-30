@@ -1,0 +1,679 @@
+#!/usr/bin/env node
+/**
+ * Verify repo catalog counts against tracked documentation files.
+ *
+ * Usage:
+ *   node scripts/ci/catalog.js
+ *   node scripts/ci/catalog.js --json
+ *   node scripts/ci/catalog.js --md
+ *   node scripts/ci/catalog.js --text
+ *   node scripts/ci/catalog.js --write --text
+ */
+
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+
+const ROOT = path.join(__dirname, '../..');
+const README_PATH = path.join(ROOT, 'README.md');
+const AGENTS_PATH = path.join(ROOT, 'AGENTS.md');
+const README_ZH_CN_PATH = path.join(ROOT, 'README.zh-CN.md');
+const DOCS_ZH_CN_README_PATH = path.join(ROOT, 'docs', 'zh-CN', 'README.md');
+const DOCS_ZH_CN_AGENTS_PATH = path.join(ROOT, 'docs', 'zh-CN', 'AGENTS.md');
+const WRITE_MODE = process.argv.includes('--write');
+
+let OUTPUT_MODE;
+if (process.argv.includes('--md')) {
+  OUTPUT_MODE = 'md';
+} else if (process.argv.includes('--text')) {
+  OUTPUT_MODE = 'text';
+} else {
+  OUTPUT_MODE = 'json';
+}
+
+function normalizePathSegments(relativePath) {
+  return relativePath.split(path.sep).join('/');
+}
+
+function listMatchingFiles(root, relativeDir, matcher) {
+  const directory = path.join(root, relativeDir);
+  if (!fs.existsSync(directory)) {
+    return [];
+  }
+
+  return fs.readdirSync(directory, { withFileTypes: true })
+    .filter(entry => matcher(entry))
+    .map(entry => normalizePathSegments(path.join(relativeDir, entry.name)))
+    .sort((a, b) => a.localeCompare(b));
+}
+
+function listSkillsRecursive(skillsRoot) {
+  if (!fs.existsSync(skillsRoot)) {
+    return [];
+  }
+
+  const found = [];
+  const topLevel = fs.readdirSync(skillsRoot, { withFileTypes: true });
+
+  for (const entry of topLevel) {
+    processTopLevelEntry(entry, skillsRoot, found);
+  }
+
+  return found.sort((a, b) => a.localeCompare(b));
+}
+
+function processTopLevelEntry(entry, skillsRoot, found) {
+  if (!entry.isDirectory()) {
+    return;
+  }
+  const entryPath = path.join(skillsRoot, entry.name);
+
+  if (fs.existsSync(path.join(entryPath, 'SKILL.md'))) {
+    found.push(`${entry.name}/SKILL.md`);
+    return;
+  }
+
+  const children = getChildrenDirs(entryPath);
+  for (const child of children) {
+    const childPath = path.join(entryPath, child.name);
+    if (fs.existsSync(path.join(childPath, 'SKILL.md'))) {
+      found.push(`${entry.name}/${child.name}/SKILL.md`);
+    }
+  }
+}
+
+function getChildrenDirs(entryPath) {
+  try {
+    return fs.readdirSync(entryPath, { withFileTypes: true })
+      .filter(child => child.isDirectory());
+  } catch (_err) { // NOSONAR: unreadable entry dir is skipped
+    return [];
+  }
+}
+
+function listRulesRecursive(root, relativeDir) {
+  const rulesRoot = path.join(root, relativeDir);
+  if (!fs.existsSync(rulesRoot)) {
+    return [];
+  }
+
+  const found = [];
+  const topLevel = fs.readdirSync(rulesRoot, { withFileTypes: true });
+
+  for (const entry of topLevel) {
+    // README.md is navigation, not rule content -- build-skill-index.js's
+    // runtime indexer already excludes it; this count must agree with that.
+    if (entry.isFile() && entry.name.endsWith('.md') && entry.name !== 'README.md') {
+      found.push(normalizePathSegments(path.join(relativeDir, entry.name)));
+      continue;
+    }
+    if (entry.isDirectory()) {
+      const nested = listMatchingFiles(
+        root,
+        path.join(relativeDir, entry.name),
+        child => child.isFile() && child.name.endsWith('.md') && child.name !== 'README.md'
+      );
+      found.push(...nested);
+    }
+  }
+
+  return found.sort((a, b) => a.localeCompare(b));
+}
+
+function buildCatalog(root = ROOT) {
+  const agents = listMatchingFiles(root, 'agents', entry => entry.isFile() && entry.name.endsWith('.md'));
+  const commands = listMatchingFiles(root, 'commands', entry => entry.isFile() && entry.name.endsWith('.md'));
+  const skills = listSkillsRecursive(path.join(root, 'skills'));
+  const rules = listRulesRecursive(root, 'rules');
+
+  return {
+    agents: { count: agents.length, files: agents, glob: 'agents/*.md' },
+    commands: { count: commands.length, files: commands, glob: 'commands/*.md' },
+    skills: { count: skills.length, files: skills, glob: 'skills/**/SKILL.md' },
+    rules: { count: rules.length, files: rules, glob: 'rules/*.md, rules/*/*.md' }
+  };
+}
+
+function readFileOrThrow(filePath) {
+  try {
+    return fs.readFileSync(filePath, 'utf8');
+  } catch (error) {
+    throw new Error(`Failed to read ${path.basename(filePath)}: ${error.message}`, { cause: error });
+  }
+}
+
+function writeFileOrThrow(filePath, content) {
+  try {
+    fs.writeFileSync(filePath, content, 'utf8');
+  } catch (error) {
+    throw new Error(`Failed to write ${path.basename(filePath)}: ${error.message}`, { cause: error });
+  }
+}
+
+function replaceOrThrow(content, regex, replacer, source) {
+  if (!regex.test(content)) {
+    throw new Error(`${source} is missing the expected catalog marker`);
+  }
+
+  return content.replace(regex, replacer);
+}
+
+function parseReadmeExpectations(readmeContent) {
+  const expectations = [];
+
+  const quickStartMatch = readmeContent.match(
+    /access to\s+(\d+)\s+agents,\s+(\d+)\s+skills,\s+and\s+(\d+)\s+(?:commands|legacy command shims?),\s+plus\s+(\d+)\s+rules/i
+  );
+  if (!quickStartMatch) {
+    throw new Error('README.md is missing the quick-start catalog summary');
+  }
+
+  expectations.push(
+    { category: 'agents', mode: 'exact', expected: Number(quickStartMatch[1]), source: 'README.md quick-start summary' },
+    { category: 'skills', mode: 'exact', expected: Number(quickStartMatch[2]), source: 'README.md quick-start summary' },
+    { category: 'commands', mode: 'exact', expected: Number(quickStartMatch[3]), source: 'README.md quick-start summary' },
+    { category: 'rules', mode: 'exact', expected: Number(quickStartMatch[4]), source: 'README.md quick-start summary' }
+  );
+
+  return expectations;
+}
+
+function parseZhRootReadmeExpectations(readmeContent) {
+  const match = readmeContent.match(/你现在可以使用\s+(\d+)\s+个代理、\s*(\d+)\s*个技能和\s*(\d+)\s*个命令/i);
+  if (!match) {
+    throw new Error('README.zh-CN.md is missing the quick-start catalog summary');
+  }
+
+  return [
+    { category: 'agents', mode: 'exact', expected: Number(match[1]), source: 'README.zh-CN.md quick-start summary' },
+    { category: 'skills', mode: 'exact', expected: Number(match[2]), source: 'README.zh-CN.md quick-start summary' },
+    { category: 'commands', mode: 'exact', expected: Number(match[3]), source: 'README.zh-CN.md quick-start summary' }
+  ];
+}
+
+function parseZhDocsReadmeExpectations(readmeContent) {
+  const expectations = [];
+
+  const quickStartMatch = readmeContent.match(/你现在可以使用\s+(\d+)\s+个智能体、\s*(\d+)\s*项技能和\s*(\d+)\s*个命令了/i);
+  if (!quickStartMatch) {
+    throw new Error('docs/zh-CN/README.md is missing the quick-start catalog summary');
+  }
+
+  expectations.push(
+    { category: 'agents', mode: 'exact', expected: Number(quickStartMatch[1]), source: 'docs/zh-CN/README.md quick-start summary' },
+    { category: 'skills', mode: 'exact', expected: Number(quickStartMatch[2]), source: 'docs/zh-CN/README.md quick-start summary' },
+    { category: 'commands', mode: 'exact', expected: Number(quickStartMatch[3]), source: 'docs/zh-CN/README.md quick-start summary' }
+  );
+
+  const tablePatterns = [
+    { category: 'agents', regex: /\|\s*智能体\s*\|\s*(?:(?:PASS:|\u2705)\s*)?(\d+)\s*个\s*\|/i, source: 'docs/zh-CN/README.md comparison table' },
+    { category: 'commands', regex: /\|\s*命令\s*\|\s*(?:(?:PASS:|\u2705)\s*)?(\d+)\s*个\s*\|/i, source: 'docs/zh-CN/README.md comparison table' },
+    { category: 'skills', regex: /\|\s*技能\s*\|\s*(?:(?:PASS:|\u2705)\s*)?(\d+)\s*项\s*\|/i, source: 'docs/zh-CN/README.md comparison table' }
+  ];
+
+  for (const pattern of tablePatterns) {
+    const match = readmeContent.match(pattern.regex);
+    if (!match) {
+      throw new Error(`${pattern.source} is missing the ${pattern.category} row`);
+    }
+
+    expectations.push({
+      category: pattern.category,
+      mode: 'exact',
+      expected: Number(match[1]),
+      source: `${pattern.source} (${pattern.category})`
+    });
+  }
+
+  return expectations;
+}
+
+function parseAgentsDocExpectations(agentsContent) {
+  const summaryMatch = agentsContent.match(/providing\s+(\d+)\s+specialized agents,\s+(\d+)(\+)?\s+skills,\s+(\d+)\s+commands/i);
+  if (!summaryMatch) {
+    throw new Error('AGENTS.md is missing the catalog summary line');
+  }
+
+  const expectations = [
+    { category: 'agents', mode: 'exact', expected: Number(summaryMatch[1]), source: 'AGENTS.md summary' },
+    {
+      category: 'skills',
+      mode: summaryMatch[3] ? 'minimum' : 'exact',
+      expected: Number(summaryMatch[2]),
+      source: 'AGENTS.md summary'
+    },
+    { category: 'commands', mode: 'exact', expected: Number(summaryMatch[4]), source: 'AGENTS.md summary' }
+  ];
+
+  const structurePatterns = [
+    {
+      category: 'agents',
+      mode: 'exact',
+      regex: /^\s*agents\/\s*[,:–-]\s*(\d+)\s+specialized subagents\s*$/im, // NOSONAR: superlinear risk accepted: input is repo-owned or local state content, never network-controlled
+      source: 'AGENTS.md project structure'
+    },
+    {
+      category: 'skills',
+      mode: 'minimum',
+      regex: /^\s*skills\/\s*[,:–-]\s*(\d+)(\+)?\s+workflow skills and domain knowledge\s*$/im, // NOSONAR: superlinear risk accepted: input is repo-owned or local state content, never network-controlled
+      source: 'AGENTS.md project structure'
+    },
+    {
+      category: 'commands',
+      mode: 'exact',
+      regex: /^\s*commands\/\s*[,:–-]\s*(\d+)\s+slash commands\s*$/im, // NOSONAR: superlinear risk accepted: input is repo-owned or local state content, never network-controlled
+      source: 'AGENTS.md project structure'
+    }
+  ];
+
+  for (const pattern of structurePatterns) {
+    const match = agentsContent.match(pattern.regex);
+    if (!match) {
+      throw new Error(`${pattern.source} is missing the ${pattern.category} entry`);
+    }
+
+    expectations.push({
+      category: pattern.category,
+      mode: pattern.mode === 'minimum' && match[2] ? 'minimum' : pattern.mode,
+      expected: Number(match[1]),
+      source: `${pattern.source} (${pattern.category})`
+    });
+  }
+
+  return expectations;
+}
+
+function parseZhAgentsDocExpectations(agentsContent) {
+  const summaryMatch = agentsContent.match(/提供\s+(\d+)\s+个专业代理、\s*(\d+)(\+)?\s*项技能、\s*(\d+)\s+条命令/i);
+  if (!summaryMatch) {
+    throw new Error('docs/zh-CN/AGENTS.md is missing the catalog summary line');
+  }
+
+  const expectations = [
+    { category: 'agents', mode: 'exact', expected: Number(summaryMatch[1]), source: 'docs/zh-CN/AGENTS.md summary' },
+    {
+      category: 'skills',
+      mode: summaryMatch[3] ? 'minimum' : 'exact',
+      expected: Number(summaryMatch[2]),
+      source: 'docs/zh-CN/AGENTS.md summary'
+    },
+    { category: 'commands', mode: 'exact', expected: Number(summaryMatch[4]), source: 'docs/zh-CN/AGENTS.md summary' }
+  ];
+
+  const structurePatterns = [
+    {
+      category: 'agents',
+      mode: 'exact',
+      regex: /^\s*agents\/\s*[,:–-]\s*(\d+)\s+个专业子代理\s*$/im, // NOSONAR: superlinear risk accepted: input is repo-owned or local state content, never network-controlled
+      source: 'docs/zh-CN/AGENTS.md project structure'
+    },
+    {
+      category: 'skills',
+      mode: 'minimum',
+      regex: /^\s*skills\/\s*[,:–-]\s*(\d+)(\+)?\s+个工作流技能和领域知识\s*$/im, // NOSONAR: superlinear risk accepted: input is repo-owned or local state content, never network-controlled
+      source: 'docs/zh-CN/AGENTS.md project structure'
+    },
+    {
+      category: 'commands',
+      mode: 'exact',
+      regex: /^\s*commands\/\s*[,:–-]\s*(\d+)\s+个斜杠命令\s*$/im, // NOSONAR: superlinear risk accepted: input is repo-owned or local state content, never network-controlled
+      source: 'docs/zh-CN/AGENTS.md project structure'
+    }
+  ];
+
+  for (const pattern of structurePatterns) {
+    const match = agentsContent.match(pattern.regex);
+    if (!match) {
+      throw new Error(`${pattern.source} is missing the ${pattern.category} entry`);
+    }
+
+    expectations.push({
+      category: pattern.category,
+      mode: pattern.mode === 'minimum' && match[2] ? 'minimum' : pattern.mode,
+      expected: Number(match[1]),
+      source: `${pattern.source} (${pattern.category})`
+    });
+  }
+
+  return expectations;
+}
+
+function evaluateExpectations(catalog, expectations) {
+  return expectations.map(expectation => {
+    const actual = catalog[expectation.category].count;
+    const ok = expectation.mode === 'minimum'
+      ? actual >= expectation.expected
+      : actual === expectation.expected;
+
+    return {
+      ...expectation,
+      actual,
+      ok
+    };
+  });
+}
+
+function formatExpectation(expectation) {
+  const comparator = expectation.mode === 'minimum' ? '>=' : '=';
+  return `${expectation.source}: ${expectation.category} documented ${comparator} ${expectation.expected}, actual ${expectation.actual}`;
+}
+
+function syncEnglishReadme(content, catalog) {
+  let nextContent = content;
+
+  nextContent = replaceOrThrow(
+    nextContent,
+    /(access to\s+)(\d+)(\s+agents,\s+)(\d+)(\s+skills,\s+and\s+)(\d+)(\s+(?:commands|legacy command shims?),\s+plus\s+)(\d+)(\s+rules)/i,
+    (...groups) =>
+      `${groups[1]}${catalog.agents.count}${groups[3]}${catalog.skills.count}${groups[5]}${catalog.commands.count} legacy command shims, plus ${catalog.rules.count}${groups[9]}`,
+    'README.md quick-start summary'
+  );
+  nextContent = replaceOrThrow(
+    nextContent,
+    /(\|\s*(?:\*\*)?Agents(?:\*\*)?\s*\|\s*(?:(?:PASS:|\u2705)\s*)?)(\d+)(\s+agents\s*\|)/i,
+    (_, prefix, __, suffix) => `${prefix}${catalog.agents.count}${suffix}`,
+    'README.md comparison table (agents)'
+  );
+  nextContent = replaceOrThrow(
+    nextContent,
+    /(\|\s*(?:\*\*)?Commands(?:\*\*)?\s*\|\s*(?:(?:PASS:|\u2705)\s*)?)(\d+)(\s+commands\s*\|)/i,
+    (_, prefix, __, suffix) => `${prefix}${catalog.commands.count}${suffix}`,
+    'README.md comparison table (commands)'
+  );
+  nextContent = replaceOrThrow(
+    nextContent,
+    /(\|\s*(?:\*\*)?Skills(?:\*\*)?\s*\|\s*(?:(?:PASS:|\u2705)\s*)?)(\d+)(\s+skills\s*\|)/i,
+    (_, prefix, __, suffix) => `${prefix}${catalog.skills.count}${suffix}`,
+    'README.md comparison table (skills)'
+  );
+  return nextContent;
+}
+
+function syncEnglishAgents(content, catalog) {
+  let nextContent = content;
+
+  nextContent = replaceOrThrow(
+    nextContent,
+    /(providing\s+)(\d+)(\s+specialized agents,\s+)(\d+)(\+?)(\s+skills,\s+)(\d+)(\s+commands)/i,
+    (...args) => {
+      const [, prefix, , agentsSuffix, , skillsPlus, skillsSuffix, , commandsSuffix] = args;
+      return `${prefix}${catalog.agents.count}${agentsSuffix}${catalog.skills.count}${skillsPlus}${skillsSuffix}${catalog.commands.count}${commandsSuffix}`;
+    },
+    'AGENTS.md summary'
+  );
+  nextContent = replaceOrThrow(
+    nextContent,
+    /^(\s*agents\/\s*[,:–-]\s*)(\d+)(\s+specialized subagents\s*)$/im, // NOSONAR: superlinear risk accepted: input is repo-owned or local state content, never network-controlled
+    (_, prefix, __, suffix) => `${prefix}${catalog.agents.count}${suffix}`,
+    'AGENTS.md project structure (agents)'
+  );
+  nextContent = replaceOrThrow(
+    nextContent,
+    /^(\s*skills\/\s*[,:–-]\s*)(\d+)(\+?)(\s+workflow skills and domain knowledge\s*)$/im, // NOSONAR: superlinear risk accepted: input is repo-owned or local state content, never network-controlled
+    (_, prefix, __, plus, suffix) => `${prefix}${catalog.skills.count}${plus}${suffix}`,
+    'AGENTS.md project structure (skills)'
+  );
+  nextContent = replaceOrThrow(
+    nextContent,
+    /^(\s*commands\/\s*[,:–-]\s*)(\d+)(\s+slash commands\s*)$/im, // NOSONAR: superlinear risk accepted: input is repo-owned or local state content, never network-controlled
+    (_, prefix, __, suffix) => `${prefix}${catalog.commands.count}${suffix}`,
+    'AGENTS.md project structure (commands)'
+  );
+
+  return nextContent;
+}
+
+function syncZhRootReadme(content, catalog) {
+  return replaceOrThrow(
+    content,
+    /(你现在可以使用\s+)(\d+)(\s+个代理、\s*)(\d+)(\s*个技能和\s*)(\d+)(\s*个命令[。.!！]?)/i,
+    (...args) => {
+      const [, prefix, , agentsSuffix, , skillsSuffix, , commandsSuffix] = args;
+      return `${prefix}${catalog.agents.count}${agentsSuffix}${catalog.skills.count}${skillsSuffix}${catalog.commands.count}${commandsSuffix}`;
+    },
+    'README.zh-CN.md quick-start summary'
+  );
+}
+
+function syncZhDocsReadme(content, catalog) {
+  let nextContent = content;
+
+  nextContent = replaceOrThrow(
+    nextContent,
+    /(你现在可以使用\s+)(\d+)(\s+个智能体、\s*)(\d+)(\s*项技能和\s*)(\d+)(\s*个命令了[。.!！]?)/i,
+    (...args) => {
+      const [, prefix, , agentsSuffix, , skillsSuffix, , commandsSuffix] = args;
+      return `${prefix}${catalog.agents.count}${agentsSuffix}${catalog.skills.count}${skillsSuffix}${catalog.commands.count}${commandsSuffix}`;
+    },
+    'README.zh-CN.md quick-start summary'
+  );
+  nextContent = replaceOrThrow(
+    nextContent,
+    /(\|\s*智能体\s*\|\s*(?:(?:PASS:|\u2705)\s*)?)(\d+)(\s*个\s*\|)/i,
+    (_, prefix, __, suffix) => `${prefix}${catalog.agents.count}${suffix}`,
+    'README.zh-CN.md comparison table (agents)'
+  );
+  nextContent = replaceOrThrow(
+    nextContent,
+    /(\|\s*命令\s*\|\s*(?:(?:PASS:|\u2705)\s*)?)(\d+)(\s*个\s*\|)/i,
+    (_, prefix, __, suffix) => `${prefix}${catalog.commands.count}${suffix}`,
+    'README.zh-CN.md comparison table (commands)'
+  );
+  nextContent = replaceOrThrow(
+    nextContent,
+    /(\|\s*技能\s*\|\s*(?:(?:PASS:|\u2705)\s*)?)(\d+)(\s*项\s*\|)/i,
+    (_, prefix, __, suffix) => `${prefix}${catalog.skills.count}${suffix}`,
+    'README.zh-CN.md comparison table (skills)'
+  );
+  return nextContent;
+}
+
+function syncZhAgents(content, catalog) {
+  let nextContent = content;
+
+  nextContent = replaceOrThrow(
+    nextContent,
+    /(提供\s+)(\d+)(\s+个专业代理、\s*)(\d+)(\+?)(\s*项技能、\s*)(\d+)(\s+条命令)/i,
+    (...args) => {
+      const [, prefix, , agentsSuffix, , skillsPlus, skillsSuffix, , commandsSuffix] = args;
+      return `${prefix}${catalog.agents.count}${agentsSuffix}${catalog.skills.count}${skillsPlus}${skillsSuffix}${catalog.commands.count}${commandsSuffix}`;
+    },
+    'docs/zh-CN/AGENTS.md summary'
+  );
+  nextContent = replaceOrThrow(
+    nextContent,
+    /^(\s*agents\/\s*[,:–-]\s*)(\d+)(\s+个专业子代理\s*)$/im, // NOSONAR: superlinear risk accepted: input is repo-owned or local state content, never network-controlled
+    (_, prefix, __, suffix) => `${prefix}${catalog.agents.count}${suffix}`,
+    'docs/zh-CN/AGENTS.md project structure (agents)'
+  );
+  nextContent = replaceOrThrow(
+    nextContent,
+    /^(\s*skills\/\s*[,:–-]\s*)(\d+)(\+?)(\s+个工作流技能和领域知识\s*)$/im, // NOSONAR: superlinear risk accepted: input is repo-owned or local state content, never network-controlled
+    (_, prefix, __, plus, suffix) => `${prefix}${catalog.skills.count}${plus}${suffix}`,
+    'docs/zh-CN/AGENTS.md project structure (skills)'
+  );
+  nextContent = replaceOrThrow(
+    nextContent,
+    /^(\s*commands\/\s*[,:–-]\s*)(\d+)(\s+个斜杠命令\s*)$/im, // NOSONAR: superlinear risk accepted: input is repo-owned or local state content, never network-controlled
+    (_, prefix, __, suffix) => `${prefix}${catalog.commands.count}${suffix}`,
+    'docs/zh-CN/AGENTS.md project structure (commands)'
+  );
+
+  return nextContent;
+}
+
+function createDocumentSpecs(paths = {}) {
+  const {
+    readmePath = README_PATH,
+    agentsPath = AGENTS_PATH,
+    zhRootReadmePath = README_ZH_CN_PATH,
+    zhDocsReadmePath = DOCS_ZH_CN_README_PATH,
+    zhDocsAgentsPath = DOCS_ZH_CN_AGENTS_PATH,
+  } = paths;
+
+  return [
+    {
+      filePath: readmePath,
+      parseExpectations: parseReadmeExpectations,
+      syncContent: syncEnglishReadme,
+    },
+    {
+      filePath: agentsPath,
+      parseExpectations: parseAgentsDocExpectations,
+      syncContent: syncEnglishAgents,
+    },
+    {
+      filePath: zhRootReadmePath,
+      parseExpectations: parseZhRootReadmeExpectations,
+      syncContent: syncZhRootReadme,
+    },
+    {
+      filePath: zhDocsReadmePath,
+      parseExpectations: parseZhDocsReadmeExpectations,
+      syncContent: syncZhDocsReadme,
+    },
+    {
+      filePath: zhDocsAgentsPath,
+      parseExpectations: parseZhAgentsDocExpectations,
+      syncContent: syncZhAgents,
+    },
+  ];
+}
+
+function createDocumentSpecsForRoot(root) {
+  return createDocumentSpecs({
+    readmePath: path.join(root, 'README.md'),
+    agentsPath: path.join(root, 'AGENTS.md'),
+    zhRootReadmePath: path.join(root, 'README.zh-CN.md'),
+    zhDocsReadmePath: path.join(root, 'docs', 'zh-CN', 'README.md'),
+    zhDocsAgentsPath: path.join(root, 'docs', 'zh-CN', 'AGENTS.md'),
+  });
+}
+
+const DOCUMENT_SPECS = createDocumentSpecs();
+
+function renderText(result) {
+  console.log('Catalog counts:');
+  console.log(`- agents: ${result.catalog.agents.count}`);
+  console.log(`- commands: ${result.catalog.commands.count}`);
+  console.log(`- skills: ${result.catalog.skills.count}`);
+  console.log(`- rules: ${result.catalog.rules.count}`);
+  console.log('');
+
+  const mismatches = result.checks.filter(check => !check.ok);
+  if (mismatches.length === 0) {
+    console.log('Documentation counts match the repository catalog.');
+    return;
+  }
+
+  console.error('Documentation count mismatches found:');
+  for (const mismatch of mismatches) {
+    console.error(`- ${formatExpectation(mismatch)}`);
+  }
+}
+
+function renderMarkdown(result) {
+  const mismatches = result.checks.filter(check => !check.ok);
+  console.log('# EGC Catalog Verification\n');
+  console.log('| Category | Count | Pattern |');
+  console.log('| --- | ---: | --- |');
+  console.log(`| Agents | ${result.catalog.agents.count} | \`${result.catalog.agents.glob}\` |`);
+  console.log(`| Commands | ${result.catalog.commands.count} | \`${result.catalog.commands.glob}\` |`);
+  console.log(`| Skills | ${result.catalog.skills.count} | \`${result.catalog.skills.glob}\` |`);
+  console.log(`| Rules | ${result.catalog.rules.count} | \`${result.catalog.rules.glob}\` |`);
+  console.log('');
+
+  if (mismatches.length === 0) {
+    console.log('Documentation counts match the repository catalog.');
+    return;
+  }
+
+  console.log('## Mismatches\n');
+  for (const mismatch of mismatches) {
+    console.log(`- ${formatExpectation(mismatch)}`);
+  }
+}
+
+function runCatalogCheck(options = {}) {
+  const root = options.root || ROOT;
+  const writeMode = options.writeMode ?? WRITE_MODE;
+  const documentSpecs = options.documentSpecs || (
+    root === ROOT ? DOCUMENT_SPECS : createDocumentSpecsForRoot(root)
+  );
+  const catalog = buildCatalog(root);
+
+  if (writeMode) {
+    for (const spec of documentSpecs) {
+      if (!fs.existsSync(spec.filePath)) continue;
+      const currentContent = readFileOrThrow(spec.filePath);
+      const nextContent = spec.syncContent(currentContent, catalog);
+      if (nextContent !== currentContent) {
+        writeFileOrThrow(spec.filePath, nextContent);
+      }
+    }
+  }
+
+  // Documents absent from the public baseline (locale variants, AGENTS root,
+  // zh-CN docs) are skipped; expectations are gathered only from documents
+  // that actually exist. Strict mode (EGC_CATALOG_STRICT=1) restores hard
+  // failure on missing optional docs.
+  const expectations = documentSpecs.flatMap(spec => {
+    if (!fs.existsSync(spec.filePath)) {
+      if (process.env.EGC_CATALOG_STRICT === '1') {
+        throw new Error(`Missing required catalog document: ${spec.filePath}`);
+      }
+      return [];
+    }
+    return spec.parseExpectations(readFileOrThrow(spec.filePath));
+  });
+  const checks = evaluateExpectations(catalog, expectations);
+  return { catalog, checks };
+}
+
+function main(options = {}) {
+  const outputMode = options.outputMode || OUTPUT_MODE;
+  const result = runCatalogCheck(options);
+
+  if (outputMode === 'json') {
+    console.log(JSON.stringify(result, null, 2));
+  } else if (outputMode === 'md') {
+    renderMarkdown(result);
+  } else {
+    renderText(result);
+  }
+
+  if (result.checks.some(check => !check.ok)) {
+    process.exit(1);
+  }
+}
+
+if (require.main === module) {
+  try {
+    main();
+  } catch (error) {
+    console.error(`ERROR: ${error.message}`);
+    process.exit(1);
+  }
+}
+
+module.exports = {
+  buildCatalog,
+  createDocumentSpecs,
+  createDocumentSpecsForRoot,
+  evaluateExpectations,
+  formatExpectation,
+  listRulesRecursive,
+  main,
+  parseAgentsDocExpectations,
+  parseReadmeExpectations,
+  parseZhAgentsDocExpectations,
+  parseZhDocsReadmeExpectations,
+  parseZhRootReadmeExpectations,
+  runCatalogCheck,
+  syncEnglishAgents,
+  syncEnglishReadme,
+  syncZhAgents,
+  syncZhDocsReadme,
+  syncZhRootReadme,
+};
