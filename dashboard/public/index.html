@@ -421,7 +421,21 @@ body.minimized footer{display:none!important;}
 .cost-bar-inp{height:100%;transition:width .6s cubic-bezier(.4,0,.2,1);}
 .cost-bar-out{height:100%;transition:width .6s cubic-bezier(.4,0,.2,1);opacity:0.4;}
 </style>
-</head>
+
+    <style>
+      /* [Patch de Responsividade Mobile/PC] */
+      header, .header, nav {
+        flex-wrap: wrap !important;
+        gap: 8px !important;
+        overflow-x: auto !important;
+      }
+      @media (max-width: 768px) {
+        .grid, [class*="grid-cols-"] {
+          grid-template-columns: 1fr !important;
+        }
+      }
+    </style>
+    </head>
 <body>
 
 <div class="greeting" id="gr">
