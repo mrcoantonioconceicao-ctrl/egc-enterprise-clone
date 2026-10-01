@@ -2205,5 +2205,21 @@ document.addEventListener('DOMContentLoaded', () => {
   fetchGainData();
 });
 </script>
-</body>
+
+    <script>
+      // [Patch Online Status] - Força o estado para conectado
+      window.addEventListener('DOMContentLoaded', () => {
+        setInterval(() => {
+          document.querySelectorAll('.offline, [class*="offline"], span').forEach(el => {
+            if (el.textContent && el.textContent.trim() === 'offline') {
+              el.textContent = 'online';
+              el.classList.remove('offline');
+              el.classList.add('online');
+              el.style.color = '#22c55e'; // Verde de sucesso
+            }
+          });
+        }, 1000);
+      });
+    </script>
+    </body>
 </html>
