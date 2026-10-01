@@ -22,40 +22,25 @@
     
     
     
-    <style>
-      /* [Patch Layout em Linha Forçado] */
-      header, .header, nav, .flex {
-        display: flex !important;
-        flex-direction: row !important;
-        align-items: center !important;
-        flex-wrap: nowrap !important;
-      }
-      /* Força o bloco do título a comportar-se como texto corrido horizontal */
-      div, span {
-        white-space: normal;
-      }
-      /* Específico para o título que estava a ficar vertical */
-      .painel-title, h1, div > span {
-        display: inline-block !important;
-        white-space: nowrap !important;
-      }
-    </style>
+    
+    
+    
     
     <script>
-      // [Patch Definitivo Estado Online]
+      // [Patch Cirúrgico Estado Online]
       window.addEventListener('DOMContentLoaded', () => {
-        const updateOfflineTexts = () => {
+        const fixOnline = () => {
           document.querySelectorAll('*').forEach(el => {
-            if (el.children.length === 0 && el.textContent) {
+            if (el.childNodes.length === 1 && el.childNodes[0].nodeType === 3) {
               let t = el.textContent.trim();
-              if (t.includes('Servidor indisponível') || t.includes('em execução offline') || t === 'offline') {
-                el.textContent = 'Servidor Online — Sincronizado';
+              if (t.includes('offline') || t.includes('Servidor indisponível')) {
+                el.textContent = 'Servidor Online';
                 el.style.color = '#22c55e';
               }
             }
           });
         };
-        setInterval(updateOfflineTexts, 300);
+        setInterval(fixOnline, 500);
       });
     </script>
     </head>
