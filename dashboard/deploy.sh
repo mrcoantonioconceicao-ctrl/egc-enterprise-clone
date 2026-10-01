@@ -15,7 +15,7 @@ fi
 
 # 2. Adicionar alterações pendentes se houver
 git add .
-if ! git diff-cached --quiet; then
+if [ -n "$(git status --porcelain)" ]; then
     echo "📦 Detetadas alterações pendentes. A criar commit automático..."
     git commit -m "chore(deploy): automatic sync and build prep for vercel"
 else
@@ -26,14 +26,18 @@ fi
 echo "🔄 A enviar alterações para o GitHub (origin solana-cockpit)..."
 git push origin solana-cockpit
 
-# 4. Executar o Deploy na Vercel
+# 4. Executar o Deploy na Vercel com verificação de erros
 echo "⚡ A disparar o deploy para a Vercel..."
 if command -v vercel &> /dev/null; then
-    vercel --prod --yes
-    echo "✅ Deploy concluído com sucesso!"
+    if vercel --prod --yes; then
+        echo "✅ Deploy concluído com sucesso!"
+    else
+        echo "❌ Erro no deploy da Vercel. Se esta for a primeira vez, faz login com: vercel login"
+        exit 1
+    fi
 else
     echo "❌ Erro: Vercel CLI não encontrada."
     echo "💡 Instala a Vercel CLI globalmente executando: npm i -g vercel"
-    echo "💡 Ou executa 'npx vercel --prod' manualmente."
+    exit 1
 fi
 echo "=========================================="
