@@ -36,23 +36,22 @@
       });
     </script>
     
+    
+    
     <style>
-      /* [Patch Definitivo de Responsividade e UI] */
-      header, .header, nav, div {
-        box-sizing: border-box;
-      }
-      /* Força o bloco do título principal a ficar em linha e sem quebras verticais */
-      h1, span, div {
-        max-width: none !important;
-      }
-      .flex, header {
+      /* [Patch Layout em Linha Forçado] */
+      header, .header, nav, .flex {
         display: flex !important;
         flex-direction: row !important;
         align-items: center !important;
         flex-wrap: nowrap !important;
       }
-      /* Corrige especificamente o bloco do título da EGC */
-      div[class*="flex"] > span, header span {
+      /* Força o bloco do título a comportar-se como texto corrido horizontal */
+      div, span {
+        white-space: normal;
+      }
+      /* Específico para o título que estava a ficar vertical */
+      .painel-title, h1, div > span {
         display: inline-block !important;
         white-space: nowrap !important;
       }
