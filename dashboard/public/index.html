@@ -400,5 +400,87 @@
 </nav>
 
 
+    
+    <script id="egc-mock-engine">
+      window.addEventListener('DOMContentLoaded', () => {
+        console.log('[EGC Mock Engine] Initializing live simulation data...');
+
+        // 1. Estado de Conexão Online
+        setTimeout(() => {
+          const wsDot = document.getElementById('wsDot');
+          const wsLbl = document.getElementById('wsLbl');
+          const activeBadge = document.getElementById('activeBadge');
+          const offlineBadge = document.getElementById('offlineBadge');
+          
+          if (wsDot) wsDot.style.background = '#10b981';
+          if (wsLbl) wsLbl.textContent = 'online (mock)';
+          if (activeBadge) activeBadge.style.display = 'flex';
+          if (offlineBadge) offlineBadge.style.display = 'none';
+
+          // 2. Preencher Projeto e Sessão
+          const projName = document.getElementById('projName');
+          if (projName) projName.textContent = 'Enterprise-Core';
+
+          const mcProj = document.getElementById('mc-proj');
+          if (mcProj) mcProj.textContent = 'egc-enterprise-clone';
+
+          // 3. Simular Memória e Contadores
+          const ltBar = document.getElementById('ltBar');
+          const wmBar = document.getElementById('wmBar');
+          const ltPct = document.getElementById('ltPct');
+          const wmPct = document.getElementById('wmPct');
+          if (ltBar) ltBar.style.width = '92%';
+          if (wmBar) wmBar.style.width = '68%';
+          if (ltPct) ltPct.textContent = '92%';
+          if (wmPct) wmPct.textContent = '68%';
+
+          const cntL = document.getElementById('cntL');
+          const cntD = document.getElementById('cntD');
+          const cntP = document.getElementById('cntP');
+          if (cntL) cntL.textContent = '24';
+          if (cntD) cntD.textContent = '12';
+          if (cntP) cntP.textContent = '8';
+
+          // 4. Agentes Ativos Mock
+          const agWrap = document.getElementById('agWrap');
+          const agCt = document.getElementById('agCt');
+          if (agWrap) {
+            agWrap.innerHTML = `
+              <div style="background:#111827;border:1px solid #1f2937;padding:12px;border-radius:8px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;">
+                <div>
+                  <div style="font-weight:600;color:#10b981;font-size:0.9rem;">Claude Sonnet 4 (Guardian)</div>
+                  <div style="font-size:0.8rem;color:#9ca3af;">Analyzing AST &amp; Security Audits</div>
+                </div>
+                <span style="font-size:0.75rem;background:rgba(16,185,129,0.1);color:#10b981;padding:4px 8px;border-radius:4px;">Active</span>
+              </div>
+              <div style="background:#111827;border:1px solid #1f2937;padding:12px;border-radius:8px;display:flex;justify-content:space-between;align-items:center;">
+                <div>
+                  <div style="font-weight:600;color:#3b82f6;font-size:0.9rem;">RustShield Engine</div>
+                  <div style="font-size:0.8rem;color:#9ca3af;">Smart Contract Verification</div>
+                </div>
+                <span style="font-size:0.75rem;background:rgba(59,130,246,0.1);color:#3b82f6;padding:4px 8px;border-radius:4px;">Ready</span>
+              </div>
+            `;
+          }
+          if (agCt) agCt.textContent = '2 active';
+
+          // 5. Timeline de Atividade Recente
+          const tlList = document.getElementById('tlList');
+          const tlCt = document.getElementById('tlCt');
+          if (tlList) {
+            tlList.innerHTML = `
+              <div style="padding:8px 0;border-bottom:1px solid #1f2937;font-size:0.85rem;color:#d1d5db;">
+                <span style="color:#10b981;font-weight:600;">[04:12]</span> Synchronized neural graph nodes with Vercel deployment.
+              </div>
+              <div style="padding:8px 0;border-bottom:1px solid #1f2937;font-size:0.85rem;color:#d1d5db;">
+                <span style="color:#3b82f6;font-weight:600;">[04:10]</span> Guardian security audit passed successfully.
+              </div>
+            `;
+          }
+          if (tlCt) tlCt.textContent = '2 events';
+
+        }, 800);
+      });
+    </script>
     </body>
 </html>
