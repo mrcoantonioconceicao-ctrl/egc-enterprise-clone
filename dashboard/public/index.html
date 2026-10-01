@@ -26,21 +26,21 @@
     
     
     
+    
+    
     <script>
-      // [Patch Cirúrgico Estado Online]
       window.addEventListener('DOMContentLoaded', () => {
-        const fixOnline = () => {
+        setInterval(() => {
           document.querySelectorAll('*').forEach(el => {
             if (el.childNodes.length === 1 && el.childNodes[0].nodeType === 3) {
-              let t = el.textContent.trim();
-              if (t.includes('offline') || t.includes('Servidor indisponível')) {
+              let t = el.textContent.trim().toLowerCase();
+              if (t.includes('offline') || t.includes('servidor indisponível')) {
                 el.textContent = 'Servidor Online';
                 el.style.color = '#22c55e';
               }
             }
           });
-        };
-        setInterval(fixOnline, 500);
+        }, 500);
       });
     </script>
     </head>
