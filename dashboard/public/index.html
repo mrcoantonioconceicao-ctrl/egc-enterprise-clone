@@ -17,34 +17,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
 
     
-    <style>
-      /* [Patch Definitivo de Responsividade e UI] */
-      header, .header, nav {
-        display: flex !important;
-        flex-direction: row !important;
-        align-items: center !important;
-        justify-content: space-between !important;
-        flex-wrap: nowrap !important;
-        overflow-x: auto !important;
-        padding: 8px 12px !important;
-        gap: 12px !important;
-      }
-      
-      /* Garante que títulos longos não quebrem a linha de forma vertical no mobile */
-      header span, .header span, nav span {
-        white-space: nowrap !important;
-      }
-
-      @media (max-width: 768px) {
-        .grid, [class*="grid-cols-"] {
-          grid-template-columns: 1fr !important;
-        }
-        /* Ajuste fino para ecrãs pequenos */
-        body {
-          font-size: 14px !important;
-        }
-      }
-    </style>
+    
     <script>
       // [Patch Definitivo Estado Online]
       window.addEventListener('DOMContentLoaded', () => {
@@ -62,6 +35,28 @@
         setInterval(forceOnline, 500);
       });
     </script>
+    
+    <style>
+      /* [Patch Definitivo de Responsividade e UI] */
+      header, .header, nav, div {
+        box-sizing: border-box;
+      }
+      /* Força o bloco do título principal a ficar em linha e sem quebras verticais */
+      h1, span, div {
+        max-width: none !important;
+      }
+      .flex, header {
+        display: flex !important;
+        flex-direction: row !important;
+        align-items: center !important;
+        flex-wrap: nowrap !important;
+      }
+      /* Corrige especificamente o bloco do título da EGC */
+      div[class*="flex"] > span, header span {
+        display: inline-block !important;
+        white-space: nowrap !important;
+      }
+    </style>
     </head>
 <body>
 
