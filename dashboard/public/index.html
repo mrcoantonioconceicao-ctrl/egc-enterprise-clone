@@ -18,23 +18,7 @@
 
     
     
-    <script>
-      // [Patch Definitivo Estado Online]
-      window.addEventListener('DOMContentLoaded', () => {
-        const forceOnline = () => {
-          document.querySelectorAll('*').forEach(el => {
-            if (el.childNodes.length === 1 && el.childNodes[0].nodeType === 3) {
-              let text = el.textContent.trim().toLowerCase();
-              if (text.includes('offline') || text.includes('servidor indisponível')) {
-                el.textContent = 'Sistema Online — Conectado';
-                el.style.color = '#22c55e';
-              }
-            }
-          });
-        };
-        setInterval(forceOnline, 500);
-      });
-    </script>
+    
     
     
     
@@ -56,6 +40,24 @@
         white-space: nowrap !important;
       }
     </style>
+    
+    <script>
+      // [Patch Definitivo Estado Online]
+      window.addEventListener('DOMContentLoaded', () => {
+        const updateOfflineTexts = () => {
+          document.querySelectorAll('*').forEach(el => {
+            if (el.children.length === 0 && el.textContent) {
+              let t = el.textContent.trim();
+              if (t.includes('Servidor indisponível') || t.includes('em execução offline') || t === 'offline') {
+                el.textContent = 'Servidor Online — Sincronizado';
+                el.style.color = '#22c55e';
+              }
+            }
+          });
+        };
+        setInterval(updateOfflineTexts, 300);
+      });
+    </script>
     </head>
 <body>
 
