@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-<title>EGC - Dashboard</title>
+<title>EGC-Solana - Cognitive Web3 Cockpit</title>
 <link rel="icon" type="image/png" href="/egc-logo.png"/>
 <link rel="manifest" href="/manifest.json"/>
 <meta name="theme-color" content="#101010"/>
@@ -116,7 +116,7 @@
         <circle cx="32" cy="32" r="8" fill="#2fd6a1"/>
         <rect x="30" y="50" width="4" height="12" rx="2" fill="#0a4d2e"/>
       </svg>
-      <div class="hd-wm"><span class="hd-wm-name">EGC - Dashboard</span></div>
+      <div class="hd-wm"><span class="hd-wm-name">EGC-Solana Cockpit</span></div>
     </a>
   </div>
   <div class="hd-center">
@@ -186,6 +186,40 @@
   </section>
 
   <section class="panel-right" id="panelRight">
+    <div class="rcard" id="consensusSection" style="border: 1px solid #10b981; margin-top: 16px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+        <span class="eye" style="color: #10b981; display: flex; align-items: center; gap: 6px;">
+          <span>⚖️</span> Auditório de Consenso &amp; Fricção Cognitiva
+        </span>
+        <span style="font-size:10px; background:rgba(16,185,129,0.1); color:#10b981; padding:3px 8px; border-radius:4px;">Ativo &amp; Monitorizado</span>
+      </div>
+      <p style="font-size:0.85rem; color:#9ca3af; margin-bottom: 12px;">
+        Registo em tempo real das divergências entre a aceleração de código dos agentes e as regras de integridade do Guardian.
+      </p>
+      <div id="consensusList" style="display: flex; flex-direction: column; gap: 8px;">
+        <div style="background: #1a2234; border-left: 3px solid #10b981; padding: 10px; border-radius: 6px; font-size: 0.85rem;">
+          <div style="display: flex; justify-content: space-between; font-weight: 600; color: #f3f4f6; margin-bottom: 4px;">
+            <span>[Consenso #104] Validação de Contrato Solana/Anchor</span>
+            <span style="color: #10b981;">Aprovado (100% Mensurável)</span>
+          </div>
+          <div style="color: #9ca3af; font-size: 0.8rem;">
+            <strong>Agente:</strong> Sugeriu otimização de loops. <br/>
+            <strong>Guardian:</strong> Verificou ausência de vulnerabilidades de reentrância. Veredito: Conforme.
+          </div>
+        </div>
+        <div style="background: #1a2234; border-left: 3px solid #f59e0b; padding: 10px; border-radius: 6px; font-size: 0.85rem;">
+          <div style="display: flex; justify-content: space-between; font-weight: 600; color: #f3f4f6; margin-bottom: 4px;">
+            <span>[Fricção #103] Injeção de Código Legado</span>
+            <span style="color: #f59e0b;">Corrigido pelo Sistema</span>
+          </div>
+          <div style="color: #9ca3af; font-size: 0.8rem;">
+            <strong>Agente:</strong> Tentativa de bypass em parâmetro não testado.<br/>
+            <strong>Guardian:</strong> Bloqueado por violar diretrizes de métricas reais. Ajustado para padrão seguro.
+          </div>
+        </div>
+      </div>
+    </div>
+    
     <div class="rcard">
       <span class="eye">Mission</span>
       <div class="rc-row"><span class="rc-label">Project</span><span class="rc-val" id="mc-proj">--</span></div>
