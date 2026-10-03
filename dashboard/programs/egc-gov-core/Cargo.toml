@@ -1,0 +1,11 @@
+[package]
+name = "egc-gov-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "egc_gov_core"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+anchor-lang = "0.29.0"

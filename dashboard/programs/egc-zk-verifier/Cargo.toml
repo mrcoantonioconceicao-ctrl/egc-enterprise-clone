@@ -1,0 +1,11 @@
+[package]
+name = "egc-zk-verifier"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "egc_zk_verifier"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+anchor-lang = "0.29.0"

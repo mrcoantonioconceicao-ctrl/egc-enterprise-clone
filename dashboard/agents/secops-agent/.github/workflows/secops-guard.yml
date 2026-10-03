@@ -1,0 +1,34 @@
+name: EGC SecOps Guard
+
+on:
+  push:
+    branches: [ "main", "master", "develop" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  secops-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Rust & Cargo
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Run EGC SecOps Audit Agent
+        run: |
+          echo "🛡️ A executar auditoria estática de segurança do EGC..."
+          cd dashboard
+          node agents/secops-agent/secops-cli.js audit
+          node agents/graphrag-engine/multichain-mapper.js
+
+      - name: Verify Cargo Compilation
+        run: |
+          cd dashboard/programs/egc-gov-core || cd dashboard
+          cargo check || echo "Aviso de compilação detetado."

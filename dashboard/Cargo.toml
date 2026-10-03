@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "programs/egc-gov-core",
+    "programs/egc-zk-verifier",
+    "zk-circuits"
+]
+resolver = "2"
